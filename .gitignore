@@ -1,0 +1,15 @@
+# Compiled binaries & build artifacts
+m5engine
+*.o
+*.dSYM/
+*.metallib
+*.air
+
+# macOS & Python artifacts
+.DS_Store
+__pycache__/
+*.pyc
+
+# Large converted model binaries
+*.m5e
+models/**/.download_status.json

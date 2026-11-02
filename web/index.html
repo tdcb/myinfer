@@ -1,0 +1,1209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>M5Engine — Apple M5 Pro LLM Control Center & HF Model Advisor</title>
+  <style>
+    :root {
+      --bg-base: #0b0d12;
+      --bg-panel: #12161f;
+      --bg-card: #181d29;
+      --bg-input: #0e121a;
+      --border: #262e40;
+      --text-main: #eef2f8;
+      --text-muted: #8c98b0;
+      --accent: #3b82f6;
+      --accent-glow: rgba(59, 130, 246, 0.22);
+      --green: #10b981;
+      --purple: #8b5cf6;
+      --amber: #f59e0b;
+      --red: #ef4444;
+      --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", sans-serif;
+      --mono: "SF Mono", "JetBrains Mono", Menlo, monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--font);
+      background: var(--bg-base);
+      color: var(--text-main);
+      height: 100vh;
+      display: flex;
+      overflow: hidden;
+    }
+    /* Sidebar */
+    .sidebar {
+      width: 370px;
+      background: var(--bg-panel);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      padding: 18px;
+      gap: 15px;
+      overflow-y: auto;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .brand-title {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .chip-badge {
+      font-size: 11px;
+      font-family: var(--mono);
+      background: rgba(16, 185, 129, 0.15);
+      color: var(--green);
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+    .section-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--text-muted);
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+    }
+    .advisor-cta {
+      background: linear-gradient(135deg, rgba(59, 130, 246, 0.22), rgba(139, 92, 246, 0.22));
+      border: 1px solid rgba(99, 102, 241, 0.55);
+      border-radius: 10px;
+      padding: 12px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .advisor-cta:hover {
+      border-color: #818cf8;
+      transform: translateY(-1px);
+    }
+    .preset-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+    .preset-btn {
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      padding: 10px 12px;
+      border-radius: 8px;
+      text-align: left;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .preset-btn:hover { border-color: var(--accent); }
+    .preset-btn.active {
+      border-color: var(--accent);
+      background: var(--accent-glow);
+    }
+    .preset-name {
+      font-size: 13px;
+      font-weight: 600;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .preset-desc { font-size: 11px; color: var(--text-muted); }
+    .arch-pill {
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: var(--mono);
+      background: rgba(59, 130, 246, 0.2);
+      color: #93c5fd;
+    }
+    .arch-pill.moe {
+      background: rgba(139, 92, 246, 0.22);
+      color: #c4b5fd;
+    }
+    .path-box {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .input-text {
+      flex: 1;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      padding: 8px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-family: var(--mono);
+    }
+    .input-text:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .btn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .btn:hover { opacity: 0.9; }
+    .btn-secondary {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-main);
+    }
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      padding: 5px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+    }
+    .stat-row:last-child { border-bottom: none; }
+    .stat-label { color: var(--text-muted); }
+    .stat-val { font-family: var(--mono); font-weight: 600; }
+
+    /* Main Chat Area */
+    .main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      position: relative;
+    }
+    .telemetry-bar {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 12px;
+      padding: 14px 20px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+    }
+    .metric-box {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    .metric-label { font-size: 11px; color: var(--text-muted); margin-bottom: 4px; }
+    .metric-value { font-size: 18px; font-weight: 700; font-family: var(--mono); color: var(--text-main); }
+    .metric-sub { font-size: 10px; color: var(--green); font-family: var(--mono); margin-top: 2px; }
+
+    .chat-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .msg {
+      max-width: 82%;
+      padding: 12px 16px;
+      border-radius: 12px;
+      font-size: 14px;
+      line-height: 1.55;
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: var(--accent);
+      color: #fff;
+      border-bottom-right-radius: 3px;
+    }
+    .msg.assistant {
+      align-self: flex-start;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 3px;
+    }
+    .msg-meta {
+      font-size: 11px;
+      font-family: var(--mono);
+      color: var(--text-muted);
+      margin-top: 6px;
+      padding-top: 6px;
+      border-top: 1px solid rgba(255,255,255,0.06);
+    }
+    .composer {
+      padding: 16px 20px;
+      background: var(--bg-panel);
+      border-top: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .composer-controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .toggle-group { display: flex; align-items: center; gap: 14px; }
+    .toggle-label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+    .composer-row { display: flex; gap: 10px; }
+    .prompt-input {
+      flex: 1;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      border-radius: 8px;
+      padding: 12px 14px;
+      font-size: 14px;
+      font-family: var(--font);
+      resize: none;
+      height: 48px;
+    }
+    .prompt-input:focus { outline: none; border-color: var(--accent); }
+
+    /* Hardware-Aware HuggingFace Model Advisor Modal */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(5, 7, 11, 0.82);
+      backdrop-filter: blur(6px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+      padding: 24px;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      width: 100%;
+      max-width: 1020px;
+      max-height: 90vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 24px 64px rgba(0,0,0,0.65);
+    }
+    .modal-header {
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .modal-body {
+      padding: 20px 24px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .envelope-banner {
+      background: rgba(16, 185, 129, 0.08);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      border-radius: 10px;
+      padding: 12px 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 12px;
+    }
+    .filter-bar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .tab-pills { display: flex; gap: 6px; flex-wrap: wrap; }
+    .tab-pill {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .tab-pill.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .hf-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(440px, 1fr));
+      gap: 14px;
+    }
+    .hf-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transition: border-color 0.15s;
+    }
+    .hf-card:hover { border-color: var(--accent); }
+    .hf-card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .score-badge {
+      background: rgba(16, 185, 129, 0.16);
+      color: var(--green);
+      border: 1px solid rgba(16, 185, 129, 0.4);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 6px;
+      white-space: nowrap;
+    }
+    .ram-bar-wrap {
+      background: var(--bg-input);
+      border-radius: 999px;
+      height: 7px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.05);
+    }
+    .ram-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--green), var(--accent));
+      border-radius: 999px;
+    }
+    .hf-metrics-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      background: var(--bg-input);
+      padding: 8px 10px;
+      border-radius: 6px;
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+  </style>
+</head>
+<body>
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-title">
+        <span>⚡ M5Engine</span>
+      </div>
+      <span class="chip-badge" id="hw-chip">Apple M5 Pro</span>
+    </div>
+
+    <!-- Engine Lifecycle & Port Control Plane -->
+    <div>
+      <div class="section-title">1. Engine Control & Port Manager</div>
+      <div class="card" style="display: flex; flex-direction: column; gap: 10px;">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <span style="font-size: 12px; color: var(--text-muted);">Engine State</span>
+          <span id="engine-state-badge" style="font-size: 11px; font-family: var(--mono); font-weight: 700; color: var(--green);">● Online (Running)</span>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;">
+          <button class="btn" style="padding: 6px 8px; font-size: 11px; background: var(--green);" onclick="controlEngine('start')">▶ Start</button>
+          <button class="btn btn-secondary" style="padding: 6px 8px; font-size: 11px;" onclick="controlEngine('restart')">↻ Restart</button>
+          <button class="btn btn-secondary" style="padding: 6px 8px; font-size: 11px; color: #fca5a5; border-color: rgba(239,68,68,0.4);" onclick="controlEngine('stop')">■ Unload</button>
+        </div>
+        <div style="border-top: 1px solid rgba(255,255,255,0.06); padding-top: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+            <span style="font-size: 11px; color: var(--text-muted);">API & UI Listening Port</span>
+            <span id="port-status-msg" style="font-size: 10px; font-family: var(--mono); color: var(--green);"></span>
+          </div>
+          <div class="path-box" style="margin-top: 0;">
+            <input type="number" id="server-port-input" class="input-text" value="8080" min="1024" max="65535" />
+            <button class="btn btn-secondary" onclick="changeServerPort()">Change Port</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Hardware-Aware HuggingFace Model Selector CTA -->
+    <div class="advisor-cta" onclick="openAdvisorModal()">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+        <span style="font-size: 13px; font-weight: 700; color: #fff;">🎯 HuggingFace Model Advisor</span>
+        <span class="arch-pill" style="background: rgba(16,185,129,0.25); color: #6ee7b7;">M5 Pro Filtered</span>
+      </div>
+      <div style="font-size: 11px; color: #cbd5e1; line-height: 1.4;">
+        Browse, <b>1-click download</b> & mount HuggingFace models filtered for your <b>51.8 GB Metal GPU Working Set</b>.
+      </div>
+    </div>
+
+    <!-- Architecture & Model Switcher -->
+    <div>
+      <div class="section-title">2. Switch Model / Architecture</div>
+      <div class="preset-grid">
+        <button class="preset-btn active" id="btn-dense" onclick="selectModel('qwen3.8-27b-m5-q4')">
+          <div class="preset-name">
+            <span>Qwen 3.8 27B (Dense)</span>
+            <span class="arch-pill">Dense + MTP</span>
+          </div>
+          <div class="preset-desc">128B Coalesced Q4_G64 + Multi-Token Speculative Verify (M=5)</div>
+        </button>
+
+        <button class="preset-btn" id="btn-moe" onclick="selectModel('qwen3.8-moe-16x4-m5-q4')">
+          <div class="preset-name">
+            <span>Qwen 3.8 MoE (16x4)</span>
+            <span class="arch-pill moe">Sparse MoE</span>
+          </div>
+          <div class="preset-desc">Zero-Sync GPU Top-4 Softmax Router + Hot Expert Pinning</div>
+        </button>
+
+        <button class="preset-btn" id="btn-heavy" onclick="selectModel('27b-heavy')">
+          <div class="preset-name">
+            <span>Qwen 27B Full Geometry</span>
+            <span class="arch-pill">5120x13824</span>
+          </div>
+          <div class="preset-desc">Full 27B Hidden/FFN Dimension Stress Profile (GQA 40/8)</div>
+        </button>
+      </div>
+
+      <!-- Installed Local Models Dropdown -->
+      <div style="margin-top: 10px;">
+        <div class="section-title">Installed Local Models (./models/)</div>
+        <div class="path-box" style="margin-top: 4px;">
+          <select id="local-model-select" class="input-text" onchange="onSelectLocalModelDropdown()">
+            <option value="./models/local-qwen-safetensors">./models/local-qwen-safetensors</option>
+          </select>
+          <button class="btn btn-secondary" onclick="mountSelectedLocalDropdown()">Mount</button>
+        </div>
+      </div>
+
+      <!-- Custom Disk Path Loader -->
+      <div style="margin-top: 10px;">
+        <div class="section-title">Custom Weights Path (.safetensors / .m5e)</div>
+        <div class="path-box" style="margin-top: 4px;">
+          <input type="text" id="custom-model-path" class="input-text" placeholder="./models/local-qwen-safetensors" />
+          <button class="btn" onclick="loadCustomModel()">Load</button>
+        </div>
+        <div id="load-status" style="font-size: 11px; color: var(--green); margin-top: 5px; display: none;"></div>
+      </div>
+
+      <!-- Direct HuggingFace Downloader in Sidebar -->
+      <div style="margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border);">
+        <div class="section-title">3. Download Model from HuggingFace</div>
+        <div class="path-box" style="margin-top: 4px;">
+          <input type="text" id="hf-direct-repo" class="input-text" placeholder="mlx-community/Qwen3-30B-A3B-Instruct-4bit" value="mlx-community/Qwen3-30B-A3B-Instruct-4bit" />
+          <button class="btn" style="white-space: nowrap;" onclick="startSidebarDownload()">⬇ Download</button>
+        </div>
+        <div id="dl-progress-wrap" style="display: none; margin-top: 8px;">
+          <div style="display: flex; justify-content: space-between; font-size: 10px; font-family: var(--mono); margin-bottom: 3px;">
+            <span id="dl-status-text" style="color: #93c5fd;">Downloading...</span>
+            <span id="dl-pct-text" style="color: var(--green);">0%</span>
+          </div>
+          <div class="ram-bar-wrap">
+            <div class="ram-bar-fill" id="dl-bar-fill" style="width: 0%; transition: width 0.2s;"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Hardware Telemetry Card -->
+    <div>
+      <div class="section-title">4. Apple M5 Pro Hardware Status</div>
+      <div class="card">
+        <div class="stat-row">
+          <span class="stat-label">CPU Topology</span>
+          <span class="stat-val" id="hw-cores">5 Super + 10 Perf</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Unified Memory</span>
+          <span class="stat-val" id="hw-ram">64 GB (51.8 GB GPU)</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Allocated Arena</span>
+          <span class="stat-val" id="hw-alloc">-- MB</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Radix KV Blocks</span>
+          <span class="stat-val" id="hw-radix">0 cached</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Thermal State</span>
+          <span class="stat-val" style="color: var(--green);" id="hw-thermal">Nominal (Cool)</span>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="main">
+    <!-- Top Live Metrics Bar -->
+    <header class="telemetry-bar">
+      <div class="metric-box">
+        <div class="metric-label">First Token Latency (TTFT)</div>
+        <div class="metric-value" id="m-ttft">-- ms</div>
+        <div class="metric-sub" id="m-prefill-speed">Prefill: -- tok/s</div>
+      </div>
+      <div class="metric-box">
+        <div class="metric-label">Decode Throughput</div>
+        <div class="metric-value" id="m-decode">-- tok/s</div>
+        <div class="metric-sub" id="m-gpu-time">Pure GPU: -- ms</div>
+      </div>
+      <div class="metric-box">
+        <div class="metric-label">Radix Prefix KV Hit</div>
+        <div class="metric-value" id="m-prefix-hit">0 toks</div>
+        <div class="metric-sub">16-tok FNV-1a Page Table</div>
+      </div>
+      <div class="metric-box">
+        <div class="metric-label">Adaptive Execution Mode</div>
+        <div class="metric-value" id="m-arch-mode" style="font-size: 14px;">Dense + MTP</div>
+        <div class="metric-sub" id="m-adaptive-detail">Tokens/Pass: --x</div>
+      </div>
+      <div class="metric-box">
+        <div class="metric-label">Active Model ID</div>
+        <div class="metric-value" id="m-model-id" style="font-size: 13px; word-break: break-all;">qwen3.8-27b-m5-q4</div>
+        <div class="metric-sub">Q4_G64 Planar Metal 3</div>
+      </div>
+    </header>
+
+    <!-- Chat Messages -->
+    <section class="chat-container" id="chat-box">
+      <div class="msg assistant">
+        <strong>M5Engine Ready on Apple M5 Pro (64GB Unified Memory).</strong><br/>
+        • Click <b>"🎯 HuggingFace Model Advisor"</b> in the top-left to browse or live-search HuggingFace models automatically filtered for your machine's 51.8 GB Metal GPU working set.<br/>
+        • Send a message below, then click <b>"⚡ Test Prefix KV Hit"</b> to see Radix Prefix Caching slash Time-To-First-Token (TTFT).
+      </div>
+    </section>
+
+    <!-- Composer -->
+    <footer class="composer">
+      <div class="composer-controls">
+        <div class="toggle-group">
+          <label class="toggle-label">
+            <input type="checkbox" id="chk-prefix" checked />
+            <span>Radix Prefix KV-Cache</span>
+          </label>
+          <label class="toggle-label">
+            <input type="checkbox" id="chk-mtp" checked />
+            <span>Dense Speculative MTP (M=5)</span>
+          </label>
+          <label class="toggle-label">
+            <span>Max Tokens:</span>
+            <input type="number" id="num-tokens" value="36" min="4" max="256" class="input-text" style="width: 64px; padding: 3px 6px;" />
+          </label>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <button class="btn btn-secondary" onclick="openAdvisorModal()">🎯 Select Efficient HF Model</button>
+          <button class="btn btn-secondary" onclick="sendPrefixBenchmark()">⚡ Test Prefix KV Hit (Multi-Turn)</button>
+        </div>
+      </div>
+
+      <div class="composer-row">
+        <textarea id="prompt-input" class="prompt-input" placeholder="Ask anything or test Dense MTP / MoE sparse routing... (Press Enter to send)" onkeydown="if(event.key==='Enter' && !event.shiftKey){event.preventDefault(); sendMessage();}"></textarea>
+        <button class="btn" style="padding: 0 22px; font-size: 14px;" onclick="sendMessage()">Send</button>
+      </div>
+    </footer>
+  </main>
+
+  <!-- Hardware-Aware HuggingFace Model Advisor Modal -->
+  <div class="modal-backdrop" id="advisor-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <div>
+          <h2 style="font-size: 18px; font-weight: 700;">🎯 Hardware-Matched HuggingFace Model Advisor</h2>
+          <p style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">
+            Showing only models that fit comfortably inside your Apple M5 Pro's wired GPU working set with zero swap thrashing and quiet thermals.
+          </p>
+        </div>
+        <button class="btn btn-secondary" onclick="closeAdvisorModal()">✕ Close</button>
+      </div>
+
+      <div class="modal-body">
+        <!-- Hardware Envelope Summary -->
+        <div class="envelope-banner">
+          <div>
+            <strong style="color: var(--green);">✓ Detected Hardware Envelope:</strong>
+            <span id="env-summary" style="font-family: var(--mono); margin-left: 6px;">
+              Apple M5 Pro | 64.0 GB Unified RAM | 51.8 GB Metal Wired Working Set | Safe Model Ceiling: &le; 36.3 GB
+            </span>
+          </div>
+          <div style="font-family: var(--mono); color: var(--amber);" id="env-filtered-note">
+            2 oversized/unquantized models hidden to prevent swap & fan spin
+          </div>
+        </div>
+
+        <!-- Filter Tabs & Live HuggingFace Hub Search -->
+        <div class="filter-bar">
+          <div class="tab-pills">
+            <button class="tab-pill active" onclick="filterAdvisor('all', this)">All Efficient Models</button>
+            <button class="tab-pill" onclick="filterAdvisor('moe_sweet_spot', this)">🔥 MoE Sweet Spot (Highest Tok/s & Silent)</button>
+            <button class="tab-pill" onclick="filterAdvisor('dense_27b_class', this)">🧠 27B–32B Dense (MTP 5x Verify)</button>
+            <button class="tab-pill" onclick="filterAdvisor('fast_coding', this)">⚡ Fast 7B–14B</button>
+          </div>
+          <div style="display: flex; gap: 6px; width: 320px;">
+            <input type="text" id="hf-live-search" class="input-text" placeholder="Live search HF (e.g. Qwen3, Gemma, MoE)..." onkeydown="if(event.key==='Enter') searchHuggingFaceLive()" />
+            <button class="btn" onclick="searchHuggingFaceLive()">Search HF</button>
+          </div>
+        </div>
+
+        <div id="advisor-action-banner" style="display: none; background: rgba(59,130,246,0.14); border: 1px solid var(--accent); border-radius: 8px; padding: 10px 14px; font-size: 12px; font-family: var(--mono);"></div>
+
+        <!-- Model Cards Grid -->
+        <div class="hf-grid" id="advisor-grid"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentModel = 'qwen3.8-27b-m5-q4';
+    let advisorCatalog = [];
+    let hardwareEnvelope = { wired_gpu_limit_gb: 51.8, max_efficient_weights_gb: 36.3 };
+    let currentFilter = 'all';
+
+    const sharedSystemPrompt =
+      "You are an expert Apple Silicon M5 Pro systems assistant running on M5Engine with 16KB page-aligned zero-copy Unified Memory, " +
+      "128-byte cache-line coalesced Q4_G64 Metal 3 kernels, FlashAttention-2 Paged GQA, Radix Prefix KV-Cache, " +
+      "Dense Multi-Token Prediction (MTP), and MoE Zero-Sync Fused Top-K Routing.";
+
+    async function refreshStats() {
+      try {
+        const r = await fetch('/v1/engine/stats');
+        const d = await r.json();
+        document.getElementById('hw-chip').textContent = d.hardware.chip;
+        document.getElementById('hw-cores').textContent = `${d.hardware.super_cores} Super + ${d.hardware.performance_cores} Perf`;
+        document.getElementById('hw-ram').textContent = `${d.hardware.total_ram_gb} GB (${(d.hardware.recommended_gpu_working_set_mb/1024).toFixed(1)}G GPU)`;
+        document.getElementById('hw-alloc').textContent = `${d.active_model.unified_memory_allocated_mb.toFixed(1)} MB`;
+        document.getElementById('hw-radix').textContent = `${d.radix_kv_cache.cached_blocks} blks (${d.radix_kv_cache.total_prefix_hit_tokens} hit toks)`;
+        document.getElementById('hw-thermal').textContent = d.hardware.thermal_state;
+        document.getElementById('m-model-id').textContent = d.active_model.model_id;
+        document.getElementById('m-arch-mode').textContent = d.active_model.arch_type;
+
+        // Engine lifecycle badge
+        const badge = document.getElementById('engine-state-badge');
+        if (d.engine_loaded) {
+          badge.textContent = '● Online (Running)';
+          badge.style.color = '#10b981';
+        } else {
+          badge.textContent = '○ Standby (0 MB GPU)';
+          badge.style.color = '#f59e0b';
+        }
+
+        if (d.server_port && document.activeElement !== document.getElementById('server-port-input')) {
+          document.getElementById('server-port-input').value = d.server_port;
+        }
+
+        // Populate installed local models dropdown
+        if (Array.isArray(d.local_models) && d.local_models.length > 0) {
+          const sel = document.getElementById('local-model-select');
+          const prev = sel.value;
+          sel.innerHTML = '';
+          for (const dir of d.local_models) {
+            const opt = document.createElement('option');
+            opt.value = dir;
+            opt.textContent = dir;
+            sel.appendChild(opt);
+          }
+          if (d.local_models.includes(prev)) sel.value = prev;
+        }
+      } catch (e) {}
+    }
+
+    async function controlEngine(action) {
+      const badge = document.getElementById('engine-state-badge');
+      badge.textContent = `⟳ ${action}...`;
+      badge.style.color = '#f59e0b';
+      try {
+        const r = await fetch('/v1/engine/control', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ action: action, model: currentModel })
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+          currentModel = d.model_id;
+          await refreshStats();
+        }
+      } catch (e) {
+        badge.textContent = 'Error';
+      }
+    }
+
+    async function changeServerPort() {
+      const newPort = parseInt(document.getElementById('server-port-input').value || '8080', 10);
+      const msgEl = document.getElementById('port-status-msg');
+      msgEl.style.color = '#f59e0b';
+      msgEl.textContent = `Binding :${newPort}...`;
+      try {
+        const r = await fetch('/v1/engine/port', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ port: newPort })
+        });
+        const d = await r.json();
+        if (d.status === 'port_changed') {
+          msgEl.style.color = '#10b981';
+          msgEl.textContent = `✓ Port :${d.new_port}`;
+          if (window.location.protocol.startsWith('http') && window.location.port && parseInt(window.location.port, 10) !== d.new_port) {
+            setTimeout(() => { window.location.href = d.redirect_url; }, 350);
+          }
+        } else {
+          msgEl.style.color = '#ef4444';
+          msgEl.textContent = d.error || 'Port error';
+        }
+      } catch (e) {
+        msgEl.style.color = '#ef4444';
+        msgEl.textContent = 'Failed';
+      }
+    }
+
+    function onSelectLocalModelDropdown() {
+      const val = document.getElementById('local-model-select').value;
+      if (val) document.getElementById('custom-model-path').value = val;
+    }
+
+    async function mountSelectedLocalDropdown() {
+      const val = document.getElementById('local-model-select').value;
+      if (!val) return;
+      document.getElementById('custom-model-path').value = val;
+      await loadModelOnServer(val);
+    }
+
+    async function startSidebarDownload() {
+      const repoId = document.getElementById('hf-direct-repo').value.trim();
+      if (!repoId) return;
+      const isMoE = repoId.toLowerCase().includes('moe') || repoId.toLowerCase().includes('a3b') || repoId.toLowerCase().includes('lite');
+      const slug = './models/' + repoId.split('/').pop().toLowerCase();
+      await downloadAndMountModelInUI(repoId, slug, isMoE ? 'MoE' : 'Dense');
+    }
+
+    async function downloadAndMountModelInUI(repoId, localDir, arch) {
+      const wrap = document.getElementById('dl-progress-wrap');
+      const statusTxt = document.getElementById('dl-status-text');
+      const pctTxt = document.getElementById('dl-pct-text');
+      const barFill = document.getElementById('dl-bar-fill');
+      const modalBanner = document.getElementById('advisor-action-banner');
+
+      wrap.style.display = 'block';
+      statusTxt.textContent = `Starting ${repoId.split('/').pop()}...`;
+      pctTxt.textContent = '10%';
+      barFill.style.width = '10%';
+
+      if (modalBanner) {
+        modalBanner.style.display = 'block';
+        modalBanner.innerHTML = `⬇ Downloading & provisioning <b>${repoId}</b> (${arch}) into <code>${localDir}</code>...`;
+      }
+
+      try {
+        await fetch('/v1/models/download', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ repo_id: repoId, local_dir: localDir, arch: arch, auto_mount: true })
+        });
+
+        for (let step = 0; step < 30; step++) {
+          await new Promise(res => setTimeout(res, 120));
+          const sr = await fetch('/v1/models/download/status');
+          const sd = await sr.json();
+          const pct = Math.min(100, Math.round(sd.progress_pct || 0));
+          pctTxt.textContent = `${pct}%`;
+          barFill.style.width = `${pct}%`;
+          statusTxt.textContent = sd.current_file ? `${sd.current_file}` : sd.status;
+
+          if (modalBanner) {
+            modalBanner.innerHTML = `⬇ <b>${sd.repo_id}</b> — ${sd.message} (<b>${pct}%</b>)`;
+          }
+
+          if (sd.status === 'completed' || pct >= 100) {
+            currentModel = sd.active_model_id || localDir;
+            document.getElementById('custom-model-path').value = sd.local_dir;
+            statusTxt.textContent = `✓ Mounted ${sd.local_dir}`;
+            if (modalBanner) {
+              modalBanner.innerHTML = `✓ Downloaded & mounted <b>${sd.active_model_id}</b> at <code>${sd.local_dir}</code>!`;
+            }
+            await refreshStats();
+            await loadAdvisorRecommendations();
+            break;
+          } else if (sd.status === 'error') {
+            statusTxt.textContent = `Error: ${sd.message}`;
+            break;
+          }
+        }
+      } catch (e) {
+        statusTxt.textContent = `Error: ${e.message}`;
+      }
+    }
+
+    async function loadAdvisorRecommendations() {
+      try {
+        const r = await fetch('/v1/models/recommendations');
+        const d = await r.json();
+        hardwareEnvelope = d.hardware_envelope;
+        advisorCatalog = d.recommended_models || [];
+        document.getElementById('env-summary').textContent =
+          `${hardwareEnvelope.chip} | ${hardwareEnvelope.total_ram_gb} GB RAM | ${hardwareEnvelope.wired_gpu_limit_gb} GB Wired GPU Limit | Efficient Ceiling: <= ${hardwareEnvelope.max_efficient_weights_gb} GB`;
+        document.getElementById('env-filtered-note').textContent =
+          `${d.filtered_out_count} oversized/FP16 models hidden to prevent swap & fan spin`;
+        renderAdvisorCards(advisorCatalog);
+      } catch (e) {}
+    }
+
+    function renderAdvisorCards(models) {
+      const grid = document.getElementById('advisor-grid');
+      grid.innerHTML = '';
+      const filtered = models.filter(m => currentFilter === 'all' || m.category === currentFilter);
+
+      if (filtered.length === 0) {
+        grid.innerHTML = '<div style="color: var(--text-muted); font-size: 13px; padding: 12px;">No matching models within your M5 Pro efficiency ceiling.</div>';
+        return;
+      }
+
+      for (const m of filtered) {
+        const card = document.createElement('div');
+        card.className = 'hf-card';
+        const isMoE = m.arch === 'MoE';
+        const pct = Math.min(100, m.working_set_pct || ((m.weights_gb + 1.5) / hardwareEnvelope.wired_gpu_limit_gb * 100));
+
+        card.innerHTML = `
+          <div class="hf-card-top">
+            <div>
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="font-size: 14px; font-weight: 700;">${m.display_name}</span>
+                <span class="arch-pill ${isMoE ? 'moe' : ''}">${isMoE ? `MoE (${m.active_params_b}B Active)` : `Dense (${m.total_params_b}B + MTP)`}</span>
+              </div>
+              <div style="font-size: 11px; font-family: var(--mono); color: var(--text-muted); margin-top: 2px;">
+                ${m.repo_id}
+              </div>
+            </div>
+            <span class="score-badge">${m.efficiency_score}% Match</span>
+          </div>
+
+          <div>
+            <div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 4px;">
+              <span style="color: var(--text-muted);">Unified Memory Footprint (${m.quant})</span>
+              <span style="font-family: var(--mono); font-weight: 600;">${m.weights_gb.toFixed(1)} GB + ${m.kv_8k_gb.toFixed(1)} GB KV (${pct.toFixed(0)}% of GPU Limit)</span>
+            </div>
+            <div class="ram-bar-wrap">
+              <div class="ram-bar-fill" style="width: ${pct.toFixed(0)}%;"></div>
+            </div>
+          </div>
+
+          <div class="hf-metrics-row">
+            <div>
+              <div style="color: var(--text-muted); font-size: 10px;">Est. Throughput</div>
+              <div style="color: var(--text-main); font-weight: 700;">~${m.est_tok_s} tok/s</div>
+            </div>
+            <div>
+              <div style="color: var(--text-muted); font-size: 10px;">Warm Prefix TTFT</div>
+              <div style="color: var(--green); font-weight: 700;">~${m.est_warm_ttft_ms} ms</div>
+            </div>
+            <div>
+              <div style="color: var(--text-muted); font-size: 10px;">Thermal / Fans</div>
+              <div style="color: #93c5fd; font-weight: 600;">${m.thermal_badge}</div>
+            </div>
+          </div>
+
+          <div style="font-size: 11px; color: var(--text-muted); line-height: 1.4;">
+            ${m.why_efficient}
+          </div>
+
+          <div style="display: flex; gap: 8px; margin-top: 2px;">
+            <button class="btn" style="flex: 1;" onclick="downloadAndMountModelInUI('${m.repo_id}', '${m.local_dir}', '${m.arch}')">
+              ${m.installed_locally ? '⚡ Mount Installed (' + m.arch + ')' : '⬇ Download & Auto-Mount (' + m.arch + ')'}
+            </button>
+            <button class="btn btn-secondary" onclick="copyDownloadCmd('${m.repo_id}', '${m.local_dir}')">
+              📋 CLI Cmd
+            </button>
+          </div>
+        `;
+        grid.appendChild(card);
+      }
+    }
+
+    function openAdvisorModal() {
+      document.getElementById('advisor-modal').classList.add('open');
+      loadAdvisorRecommendations();
+    }
+
+    function closeAdvisorModal() {
+      document.getElementById('advisor-modal').classList.remove('open');
+    }
+
+    function filterAdvisor(cat, btnEl) {
+      currentFilter = cat;
+      document.querySelectorAll('.tab-pill').forEach(b => b.classList.remove('active'));
+      if (btnEl) btnEl.classList.add('active');
+      renderAdvisorCards(advisorCatalog);
+    }
+
+    async function prepareAndMountHFModel(repoId, localDir, arch) {
+      const banner = document.getElementById('advisor-action-banner');
+      banner.style.display = 'block';
+      banner.textContent = `Configuring & mounting ${repoId} (${arch}) into Apple M5 Pro Unified Memory...`;
+      try {
+        const r = await fetch('/v1/models/prepare', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ repo_id: repoId, local_dir: localDir, arch: arch })
+        });
+        const d = await r.json();
+        if (d.status === 'mounted') {
+          currentModel = d.model_id;
+          document.getElementById('custom-model-path').value = d.local_dir;
+          banner.innerHTML =
+            `✓ Mounted <b>${d.model_id}</b> (${d.arch_type})! To pull full weights from HuggingFace Hub, run:<br/>` +
+            `<code style="color:#6ee7b7;">${d.cli_download_cmd}</code>`;
+          await refreshStats();
+          setTimeout(() => closeAdvisorModal(), 1400);
+        }
+      } catch (e) {
+        banner.textContent = 'Error: ' + e.message;
+      }
+    }
+
+    function copyDownloadCmd(repoId, localDir) {
+      const cmd = `python3 tools/download_model.py --repo ${repoId} --out ${localDir}`;
+      navigator.clipboard?.writeText(cmd);
+      const banner = document.getElementById('advisor-action-banner');
+      banner.style.display = 'block';
+      banner.innerHTML = `📋 Copied terminal command to clipboard:<br/><code style="color:#6ee7b7;">${cmd}</code>`;
+    }
+
+    // Live search against HuggingFace Hub API with client-side M5 Pro 64GB Efficiency Filtering!
+    async function searchHuggingFaceLive() {
+      const q = document.getElementById('hf-live-search').value.trim() || 'Qwen 4bit';
+      const banner = document.getElementById('advisor-action-banner');
+      banner.style.display = 'block';
+      banner.textContent = `Querying HuggingFace Hub for "${q}" and filtering against your ${hardwareEnvelope.max_efficient_weights_gb} GB M5 Pro efficiency ceiling...`;
+
+      try {
+        const url = `https://huggingface.co/api/models?search=${encodeURIComponent(q)}&limit=30&sort=downloads&direction=-1`;
+        const resp = await fetch(url);
+        const items = await resp.json();
+
+        const liveModels = [];
+        let rejectedOversized = 0;
+
+        for (const item of items) {
+          const id = item.id || '';
+          const lower = id.toLowerCase();
+
+          // Parse parameter count from repo name (e.g. 7b, 14b, 27b, 30b-a3b, 32b, 70b, 72b)
+          const paramMatch = lower.match(/(\d+(?:\.\d+)?)b/);
+          if (!paramMatch) continue;
+          const totalB = parseFloat(paramMatch[1]);
+          if (totalB < 0.5) continue;
+
+          const is4Bit = lower.includes('4bit') || lower.includes('q4') || lower.includes('awq') || lower.includes('gptq');
+          const is8Bit = lower.includes('8bit') || lower.includes('q8');
+          const bytesPerParam = is4Bit ? 0.56 : (is8Bit ? 1.05 : 2.0);
+          const weightsGb = totalB * bytesPerParam;
+
+          // Filter out any model that exceeds our M5 Pro efficient weight ceiling (36.3 GB) or unquantized >20B!
+          if (weightsGb > hardwareEnvelope.max_efficient_weights_gb || (!is4Bit && !is8Bit && totalB > 16)) {
+            rejectedOversized++;
+            continue;
+          }
+
+          const activeMatch = lower.match(/a(\d+(?:\.\d+)?)b/);
+          const isMoE = lower.includes('moe') || activeMatch !== null || lower.includes('mixtral');
+          const activeB = activeMatch ? parseFloat(activeMatch[1]) : (isMoE ? Math.max(2.0, totalB * 0.15) : totalB);
+          const kvGb = Math.max(0.6, totalB * 0.06);
+          const workingPct = ((weightsGb + kvGb) / hardwareEnvelope.wired_gpu_limit_gb) * 100.0;
+
+          // Estimate M5 Pro tok/s from active memory traffic per pass + MTP
+          const activeReadGb = activeB * bytesPerParam;
+          const estTokS = Math.min(240, Math.max(22, Math.round((220 / Math.max(0.8, activeReadGb)) * (isMoE ? 1.0 : 2.2))));
+          const slug = './models/' + id.split('/').pop().toLowerCase();
+
+          liveModels.push({
+            repo_id: id,
+            display_name: id.split('/').pop(),
+            arch: isMoE ? 'MoE' : 'Dense',
+            category: isMoE ? 'moe_sweet_spot' : (totalB >= 20 ? 'dense_27b_class' : 'fast_coding'),
+            quant: is4Bit ? '4-bit Q4_G64' : (is8Bit ? '8-bit Q8_0' : 'FP16'),
+            total_params_b: totalB,
+            active_params_b: activeB,
+            weights_gb: weightsGb,
+            kv_8k_gb: kvGb,
+            working_set_pct: workingPct,
+            est_tok_s: estTokS,
+            est_warm_ttft_ms: Math.max(8, Math.round(activeB * 0.9)),
+            thermal_badge: weightsGb <= 18 ? 'Silent (Fans Off)' : 'Cool / Quiet',
+            efficiency_score: Math.min(99, Math.max(80, Math.round(100 - workingPct * 0.25))),
+            why_efficient: `Passed M5 Pro hardware filter (${weightsGb.toFixed(1)} GB <= ${hardwareEnvelope.max_efficient_weights_gb} GB ceiling; ${ downloadsText(item.downloads) }).`,
+            local_dir: slug,
+            preset_target: isMoE ? 'moe' : 'dense'
+          });
+        }
+
+        if (liveModels.length > 0) {
+          currentFilter = 'all';
+          renderAdvisorCards(liveModels);
+          banner.textContent = `✓ Found ${liveModels.length} compatible HuggingFace models for your M5 Pro (automatically hid ${rejectedOversized} oversized/unquantized models).`;
+        } else {
+          banner.textContent = `No compatible models found for "${q}" under ${hardwareEnvelope.max_efficient_weights_gb} GB (${rejectedOversized} oversized models were filtered out). Showing curated M5 Pro catalog.`;
+          renderAdvisorCards(advisorCatalog);
+        }
+      } catch (err) {
+        banner.textContent = `Offline / sandboxed browser mode: showing built-in hardware-scored M5 Pro catalog.`;
+        renderAdvisorCards(advisorCatalog);
+      }
+    }
+
+    function downloadsText(n) {
+      if (!n) return 'HuggingFace Hub';
+      return n >= 1000 ? `${(n/1000).toFixed(1)}k downloads` : `${n} downloads`;
+    }
+
+    function updatePresetButtons(model) {
+      document.getElementById('btn-dense').classList.toggle('active', model === 'qwen3.8-27b-m5-q4' || model === 'dense');
+      document.getElementById('btn-moe').classList.toggle('active', model.includes('moe'));
+      document.getElementById('btn-heavy').classList.toggle('active', model.includes('heavy') || model.includes('geometry'));
+    }
+
+    async function selectModel(modelName) {
+      currentModel = modelName;
+      updatePresetButtons(modelName);
+      await loadModelOnServer(modelName);
+    }
+
+    async function loadCustomModel() {
+      const p = document.getElementById('custom-model-path').value.trim();
+      if (!p) return;
+      currentModel = p;
+      updatePresetButtons(p);
+      await loadModelOnServer(p);
+    }
+
+    async function loadModelOnServer(modelPathOrPreset) {
+      const statusEl = document.getElementById('load-status');
+      statusEl.style.display = 'block';
+      statusEl.style.color = '#f59e0b';
+      statusEl.textContent = `Mounting ${modelPathOrPreset} into Unified Memory...`;
+      try {
+        const r = await fetch('/v1/models/load', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ model: modelPathOrPreset })
+        });
+        const d = await r.json();
+        if (d.status === 'loaded') {
+          currentModel = d.model_id;
+          statusEl.style.color = '#10b981';
+          statusEl.textContent = `✓ Loaded ${d.model_id} (${d.arch_type})`;
+          await refreshStats();
+        } else {
+          statusEl.style.color = '#ef4444';
+          statusEl.textContent = `Error: ${d.error || 'Failed'}`;
+        }
+      } catch (e) {
+        statusEl.style.color = '#ef4444';
+        statusEl.textContent = `Request failed: ${e.message}`;
+      }
+    }
+
+    function appendMessage(role, text, metaText = '') {
+      const box = document.getElementById('chat-box');
+      const div = document.createElement('div');
+      div.className = `msg ${role}`;
+      const bodySpan = document.createElement('div');
+      bodySpan.textContent = text;
+      div.appendChild(bodySpan);
+      if (metaText) {
+        const m = document.createElement('div');
+        m.className = 'msg-meta';
+        m.textContent = metaText;
+        div.appendChild(m);
+      }
+      box.appendChild(div);
+      box.scrollTop = box.scrollHeight;
+      return { div, bodySpan };
+    }
+
+    async function sendChatRequest(userText) {
+      appendMessage('user', userText);
+      const assistantNode = appendMessage('assistant', '...');
+
+      const maxTokens = parseInt(document.getElementById('num-tokens').value || '36', 10);
+      const usePrefix = document.getElementById('chk-prefix').checked;
+      const useMtp = document.getElementById('chk-mtp').checked;
+
+      try {
+        const resp = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            model: currentModel,
+            max_tokens: maxTokens,
+            stream: false,
+            use_prefix_cache: usePrefix,
+            use_speculative_mtp: useMtp,
+            messages: [
+              { role: 'system', content: sharedSystemPrompt },
+              { role: 'user', content: userText }
+            ]
+          })
+        });
+        const data = await resp.json();
+        const content = data.choices?.[0]?.message?.content || '(empty)';
+        const t = data.m5_hardware_telemetry || {};
+
+        assistantNode.bodySpan.textContent = content;
+
+        const meta = document.createElement('div');
+        meta.className = 'msg-meta';
+        const modeInfo = t.active_experts_per_tok > 0
+          ? `MoE Top-${t.active_experts_per_tok} (${t.pinned_hot_experts} Hot Experts Pinned)`
+          : `MTP ${t.mean_tokens_per_pass?.toFixed(2)}x tok/pass (${t.forward_passes} passes)`;
+        meta.textContent = `TTFT: ${t.ttft_ms?.toFixed(2)} ms | Decode: ${t.decode_tokens_per_sec?.toFixed(1)} tok/s | Prefix Cached: ${t.prefix_cached_tokens} toks | ${modeInfo}`;
+        assistantNode.div.appendChild(meta);
+
+        // Update Top Telemetry Bar
+        document.getElementById('m-ttft').textContent = `${t.ttft_ms?.toFixed(2)} ms`;
+        document.getElementById('m-prefill-speed').textContent = `Prefill: ${t.prefill_tokens_per_sec?.toFixed(0)} tok/s`;
+        document.getElementById('m-decode').textContent = `${t.decode_tokens_per_sec?.toFixed(1)} tok/s`;
+        document.getElementById('m-gpu-time').textContent = `Pure GPU: ${t.pure_gpu_ms?.toFixed(1)} ms`;
+        document.getElementById('m-prefix-hit').textContent = `${t.prefix_cached_tokens} / ${data.usage?.prompt_tokens} toks`;
+        document.getElementById('m-arch-mode').textContent = t.architecture || '';
+        document.getElementById('m-adaptive-detail').textContent = modeInfo;
+        document.getElementById('m-model-id').textContent = data.model;
+
+        await refreshStats();
+      } catch (err) {
+        assistantNode.bodySpan.textContent = 'Error communicating with M5Engine: ' + err.message;
+      }
+    }
+
+    async function sendMessage() {
+      const input = document.getElementById('prompt-input');
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = '';
+      await sendChatRequest(text);
+    }
+
+    async function sendPrefixBenchmark() {
+      await sendChatRequest("Follow-up turn sharing the cached system prompt prefix: show me the Radix KV-Cache TTFT speedup.");
+    }
+
+    refreshStats();
+  </script>
+</body>
+</html>
