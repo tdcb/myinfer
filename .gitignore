@@ -18,3 +18,4 @@ models/**/.download_status.json
 /models/
 .pytest_cache/
 *.egg-info/
+.venv/
