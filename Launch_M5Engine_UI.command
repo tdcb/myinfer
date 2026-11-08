@@ -1,15 +1,22 @@
 #!/bin/zsh
-# 1-Click macOS Finder Launcher for M5Engine Control Center & Web UI
+# Double-click launcher for the M5Engine web UI + OpenAI-compatible server (MLX backend).
+# Usage: ./Launch_M5Engine_UI.command [port] [model]
 cd "$(dirname "$0")"
 
 PORT=${1:-8080}
-MODEL=${2:-dense}
+MODEL=${2:-}
 
-if [ ! -f "./m5engine" ]; then
-  echo "[*] Building M5Engine for Apple M5 Pro..."
-  make -j8
+if [ ! -d ".venv" ]; then
+  echo "[*] Creating Python environment (.venv) and installing MLX..."
+  python3 -m venv .venv || exit 1
+  ./.venv/bin/pip install -q --upgrade pip
+  ./.venv/bin/pip install -q -r requirements.txt || exit 1
 fi
 
-echo "[*] Launching M5Engine Web UI & Control Plane on http://127.0.0.1:${PORT} ..."
-(sleep 0.8 && open "http://127.0.0.1:${PORT}") &
-./m5engine serve --model "${MODEL}" --port "${PORT}"
+echo "[*] M5Engine on http://127.0.0.1:${PORT}"
+(sleep 2 && open "http://127.0.0.1:${PORT}") &
+if [ -n "${MODEL}" ]; then
+  ./.venv/bin/python -m m5engine serve --port "${PORT}" --model "${MODEL}"
+else
+  ./.venv/bin/python -m m5engine serve --port "${PORT}"
+fi

@@ -1,0 +1,6 @@
+# m5engine patches two mlx-lm internals (quantized attention, KV quantization);
+# bump mlx-lm deliberately and re-run `pytest tests` when upgrading.
+mlx>=0.32.4
+mlx-lm==0.31.3
+numpy
+huggingface_hub

@@ -1,124 +1,107 @@
-# M5Engine: Native Apple Silicon LLM Inference Engine (Metal 3 + Zero-Copy Unified Memory)
+# M5Engine: local LLM inference for Apple Silicon (MLX)
 
-**M5Engine** is a native C++17 / Objective-C++ / Metal 3 LLM inference engine purpose-built for the **Apple M5 Pro (64GB Unified Memory, 5 Super Cores + 10 Performance Cores, 128-byte cache lines, 16KB VM pages)**.
+M5Engine serves dense and Mixture-of-Experts models on an Apple-Silicon Mac
+(tuned for a 64 GB M5 Pro). It has an OpenAI-compatible API and a web control
+panel. Compute runs on [MLX](https://github.com/ml-explore/mlx) /
+[mlx-lm](https://github.com/ml-explore/mlx-lm), so it uses the real model
+architectures, tokenizers and chat templates. On top of that, M5Engine adds:
 
-It is designed specifically to eliminate the three root causes of slow inference, high Time-To-First-Token (TTFT), and loud fan spin when running large **Dense (e.g., Qwen 3.8 27B)** and **Mixture-of-Experts (MoE)** models on generic frameworks like MLX.
+- **Maximum context sizing.** After loading the weights, M5Engine measures the
+  model's real KV-cache cost per token and sizes the context to fill the GPU
+  memory budget. The KV cache is 8-bit by default (4-bit optional).
+  Long-context attention uses a blocked online-softmax, so prefill at 100K+
+  tokens doesn't need a full score matrix. For Qwen2/Qwen3 models, YaRN
+  extends the native 32K window up to 4x (128K). It is only switched on for
+  requests longer than the native window, so short prompts keep normal
+  quality.
+- **SSD expert streaming for MoE models larger than memory.** Attention,
+  embeddings, routers and shared experts stay resident. Routed experts are
+  read on demand from the safetensors files into a byte-bounded LRU cache,
+  with parallel `pread`s, `F_NOCACHE` on macOS, and the next layer's experts
+  prefetched during decode. This is turned on automatically when a MoE model
+  doesn't fit.
+- **Prefix KV cache.** Multi-turn chats reuse the KV cache of the longest
+  matching prefix. It is moved, not copied, so it costs no extra memory, and
+  its size counts against the KV budget.
+- **Speculative decoding** with a real draft model (e.g. Qwen3-0.6B for Qwen3).
 
----
+## Quick start
 
-## Why MLX Spins Fans & Bottlenecks on 27B Models vs. How M5Engine Fixes It
-
-| Bottleneck in Generic / MLX Run-times | M5Engine Hardware-Native Solution | Measured Impact on Apple M5 Pro |
-| :--- | :--- | :--- |
-| **1. Redundant Prefill Compute on Chat Turns**<br>Re-evaluating system prompts & chat history on every turn locks the GPU ALU array at 100% power for seconds, spiking die temp and fans. | **Content-Addressed Radix Prefix Paged KV-Cache (`kBlockSize=16`)**<br>Rolling 64-bit block hashes match shared prefixes in $O(1)$ per block and reuse physical KV pages in Unified Memory with zero recomputation. | **18.2x–30x faster TTFT** on multi-turn chat (`1040 ms -> 20–57 ms`) & **>95% reduction in prefill heat** |
-| **2. Memory Bandwidth Wall on 27B Dense Decode**<br>Reading ~15 GB of 4-bit weights for $M=1$ token at a time caps throughput at $\text{BW} / \text{ModelSize}$ while thrashing the memory bus. | **128B Cache-Line Coalesced `Q4_G64` Kernels + Multi-Token Prediction (MTP) Batched Verification**<br>Reads 4-bit weights **once** into GPU registers and verifies $1+K$ tokens ($M=5$) simultaneously, plus fuses `Gate + Up + SwiGLU` to halve activation traffic. | **2.5x–4.7x higher decode tok/s** with **3.5x–4.7x fewer weight-read forward passes** |
-| **3. CPU-GPU Sync Stalls & Thrashing on MoE**<br>Reading router logits back to CPU or launching separate kernels per expert stalls the Metal pipeline every layer; cold experts thrash VM compression. | **Zero-Sync Device-Side Fused Top-$K$ Softmax Router + Hot-Expert Pinning**<br>`moe_router_topk_softmax` + `moe_fused_gate_up_swiglu_q4_g64` run 100% on GPU with zero CPU sync, while `madvise(MADV_WILLNEED)` pins hot experts in RAM. | **Zero pipeline stalls**, sparse active memory reads, and pinned hot expert residency |
-| **4. CPU Busy-Wait Spin & Multi-Encoder Overhead**<br>Spin-waiting on `MTLCommandBuffer` burns 15–25W on the 5 M5 Pro Super cores even when decode is GPU memory-bound. | **Single Command-Buffer Full-Model Dispatch + Zero-Spin GCD Semaphore Sleep**<br>Encodes all layers into **one** `MTLCommandBuffer` (`commandBufferWithUnretainedReferences`) and sleeps the CPU via `dispatch_semaphore_wait`. | **0% CPU spin during GPU execution**; Thermal State stays **Nominal (Cool / Fans Idle)** |
-
----
-
-## Architecture Overview
-
-```
-                     ┌─────────────────────────────────────────────────────────┐
-                     │        OpenAI-Compatible HTTP & SSE Server              │
-                     │  POST /v1/chat/completions | GET /v1/models | /stats    │
-                     └────────────────────────────┬────────────────────────────┘
-                                                  │
-                     ┌────────────────────────────▼────────────────────────────┐
-                     │          Radix Prefix Tree Paged KV-Cache               │
-                     │  16-token physical pages | 64-bit rolling FNV/Murmur    │
-                     │  Instant prefix hit -> skips 95%+ of prefill FLOPs      │
-                     └────────────────────────────┬────────────────────────────┘
-                                                  │
-                     ┌────────────────────────────▼────────────────────────────┐
-                     │        Adaptive Model Execution Router (M5 Pro)         │
-                     ├────────────────────────────┬────────────────────────────┤
-                     │   DENSE ARCHITECTURE       │     MoE ARCHITECTURE       │
-                     │ (e.g. Qwen 3.8 27B Dense)  │ (e.g. Qwen 3.8 MoE 16x4)   │
-                     │ • Thermal Chunked Prefill  │ • Device Top-K Softmax     │
-                     │ • simdgroup_matrix 8x8 MMA │ • Zero CPU-GPU Router Sync │
-                     │ • MTP Speculative Verify   │ • Fused Sparse Expert      │
-                     │   (M=5 tokens per weight   │   Gate+Up+SwiGLU Kernel    │
-                     │    read pass in registers) │ • Dynamic Hot-Expert       │
-                     │ • Fused Gate+Up+SwiGLU     │   madvise(MADV_WILLNEED)   │
-                     └────────────────────────────┴────────────────────────────┘
-                                                  │
-                     ┌────────────────────────────▼────────────────────────────┐
-                     │   Zero-Copy 16KB Page-Aligned Unified Memory Arena      │
-                     │   mmap() + MTLBuffer(newBufferWithBytesNoCopy, Shared)  │
-                     └─────────────────────────────────────────────────────────┘
-```
-
----
-
-## Project Layout
-
-* [`include/hardware_m5.hpp`](include/hardware_m5.hpp) / [`src/hardware_m5.mm`](src/hardware_m5.mm): Detects M5 Pro core topology (5 Super + 10 Performance cores, 16MB/8MB L2 caches, 64GB Unified Memory, 53GB wired working set), monitors Darwin `NSProcessInfoThermalState`, and computes thermal-aware prefill chunk sizes.
-* [`include/memory_arena.hpp`](include/memory_arena.hpp) / [`src/memory_arena.mm`](src/memory_arena.mm): 16KB Darwin page-aligned zero-copy allocator wrapping `posix_memalign` and `mmap` directly into `MTLBuffer` (`MTLResourceStorageModeShared`) with multi-slab sharding (>40GB support) and `madvise` residency pinning.
-* [`src/kernels.metal`](src/kernels.metal): 13 hand-tuned Metal 3 compute kernels:
-  * `rmsnorm_f16` & `fused_add_rmsnorm_f16`
-  * `qkv_rope_paged_kv_f16` (Fused NeoX/Qwen split-half RoPE + direct scatter into Paged KV-Cache)
-  * `flash_attn_paged_gqa_f16` (Online-softmax FlashAttention-2 reading directly from Paged GQA KV tables)
-  * `gemm_q4_g64_batched_f16` (128-byte M5 Pro cache-line coalesced SIMD-group kernel reading `Q4_G64` weights once across up to 8 tokens in registers)
-  * `gemm_q4_g64_simdgroup_mma_f16` (Hardware `simdgroup_matrix<half, 8, 8>` MMA kernel for prefill batches $M \ge 16$)
-  * `fused_gate_up_swiglu_q4_g64` & `gemm_q4_g64_residual_add_f16`
-  * `moe_router_topk_softmax`, `moe_fused_gate_up_swiglu_q4_g64`, & `moe_down_accumulate_q4_g64`
-  * `embedding_lookup_q4_g64` & `argmax_f16`
-* [`include/kv_cache.hpp`](include/kv_cache.hpp) / [`src/kv_cache.cpp`](src/kv_cache.cpp): Content-addressed Radix Prefix Tree Paged KV-Cache with $O(1)$ speculative rollback.
-* [`include/engine.hpp`](include/engine.hpp) / [`src/engine.cpp`](src/engine.cpp): Adaptive Dense + MoE execution runtime.
-* [`include/openai_server.hpp`](include/openai_server.hpp) / [`src/openai_server.cpp`](src/openai_server.cpp): Zero-dependency OpenAI-compatible HTTP & Server-Sent Events (SSE) server.
-
----
-
-## Quick Start
-
-### 1. Build Native Binary
 ```bash
-make
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# Web UI + API on http://127.0.0.1:8080 (load models from the UI)
+python -m m5engine serve
+
+# ...or load a model at startup
+python -m m5engine serve --model mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
+
+# Print the memory / context plan for a model
+python -m m5engine plan --model mlx-community/Qwen3-32B-4bit
 ```
 
-### 2. Run M5 Pro Hardware & Architecture Benchmarks
+`Launch_M5Engine_UI.command` sets up `.venv` and starts the server from Finder.
+
+### Getting the most context
+
+The GPU budget defaults to Metal's recommended working set, which is about
+75% of RAM. To give the GPU more of a 64 GB machine (this resets on reboot):
+
 ```bash
-./m5engine bench
+sudo sysctl iogpu.wired_limit_mb=57344   # 56 GB for the GPU, 8 GB for macOS
 ```
 
-### 3. Run End-to-End OpenAI API & SSE Streaming Self-Test
+Then pick `--kv-bits 4` for roughly 1.9x more tokens than 8-bit. The UI and
+`/v1/engine/stats` show `max_context` and whether it is limited by memory,
+by the model's position limit, or by your `--max-context`.
+
+## What fits on a 64 GB M5 Pro
+
+| Model | Weights | Mode |
+|---|---|---|
+| Qwen3-32B / Qwen2.5-32B 4-bit (dense) | 18.4 GB | in memory, 128K context with YaRN |
+| Gemma-3-27B 4-bit (dense) | 16.8 GB | in memory |
+| Qwen3-30B-A3B 4-bit (MoE, 3B active) | 17.2 GB | in memory, 128K context |
+| Qwen3-Next-80B-A3B 4-bit (MoE) | 44.8 GB | in memory |
+| GLM-4.5-Air 4-bit (MoE, 12B active) | 60.1 GB | expert streaming |
+| Qwen3-235B-A22B 3/4-bit (MoE, 22B active) | 103 / 132 GB | expert streaming |
+
+Decode speed is bounded by memory bandwidth for in-memory models. For streamed
+models it is bounded by SSD reads of cache-missing experts, so a bigger
+`--expert-cache-gb` trades context for speed.
+
+## Layout
+
+```
+m5engine/
+  engine.py         model lifecycle, generation, context enforcement
+  context.py        KV footprint measurement, context planner, YaRN
+  attention.py      memory-bounded attention over quantized KV
+  expert_stream.py  SSD expert streaming + LRU expert cache + prefetch
+  prefix_cache.py   longest-prefix KV reuse
+  hardware.py       RAM / GPU working set / thermal state
+  server.py         OpenAI-compatible HTTP server and control API
+  models.py         local models, downloads, recommendations
+web/index.html      control panel
+tests/              unit tests (no downloads needed)
+tools/              API end-to-end check, downloader
+native/             previous C++/Metal engine, kept as a base for custom kernels
+```
+
+## Tests
+
 ```bash
-./m5engine test-api
+pip install pytest
+pytest tests                              # unit tests: attention, planner, prefix cache, expert streaming
+python tools/test_openai_api.py --port 8080   # against a running server with a real model
 ```
 
-### 4. Start the OpenAI-Compatible API Server
-```bash
-./m5engine serve --port 8080 --model dense
-```
+## Status
 
-#### Querying with `curl` or OpenAI SDK:
-```bash
-# Streaming Chat Completion (Dense Model with Speculative MTP & Prefix KV Cache)
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.8-27b-m5-q4",
-    "stream": true,
-    "max_tokens": 64,
-    "messages": [
-      {"role": "system", "content": "You are a helpful coding assistant."},
-      {"role": "user", "content": "Explain Apple M5 Pro inference optimizations."}
-    ]
-  }'
-
-# Dynamic switch to Mixture-of-Experts (MoE) Sparse Routing
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.8-moe-16x4-m5-q4",
-    "max_tokens": 48,
-    "messages": [
-      {"role": "user", "content": "Run sparse MoE routing on Apple M5 Pro."}
-    ]
-  }'
-
-# Inspect Real-Time M5 Pro Hardware, Thermal, and Radix Cache Telemetry
-curl http://127.0.0.1:8080/v1/engine/stats
-```
+- Verified on Linux/CPU MLX against real checkpoints (Qwen3-0.6B,
+  OLMoE-1B-7B, Qwen3-30B-A3B). Streamed-expert outputs are bit-identical to
+  the fully resident model. Performance on Apple GPUs has not been benchmarked
+  yet.
+- Custom Metal kernels (`native/`) are planned only where profiling on the
+  M5 shows MLX is the bottleneck.
