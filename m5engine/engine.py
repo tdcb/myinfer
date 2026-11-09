@@ -25,6 +25,7 @@ from .context import (
     KVFootprint,
     apply_yarn,
     combine,
+    kv_estimate_per_token,
     measure_kv_footprint,
     native_context,
     plan_context,
@@ -124,15 +125,12 @@ def _param_bytes(model) -> int:
     return sum(v.nbytes for _, v in tree_flatten(model.parameters()))
 
 
-def _kv_estimate_per_token(config: dict, kv_bits: int) -> float:
-    """Upper-bound KV bytes/token from the config, used only before weights are loaded."""
-    tc = config.get("text_config", config)
-    layers = int(tc.get("num_hidden_layers") or 32)
-    heads = int(tc.get("num_attention_heads") or 32)
-    kv_heads = int(tc.get("num_key_value_heads") or heads)
-    head_dim = int(tc.get("head_dim") or (int(tc.get("hidden_size") or 4096) // heads))
-    per_elem = 2.0 if not kv_bits else kv_bits / 8 + 4 / 64
-    return 2 * layers * kv_heads * head_dim * per_elem
+BENCH_PASSAGE = (
+    "Unified memory lets the CPU and GPU share one pool of high-bandwidth memory, so model weights "
+    "are read in place instead of being copied between devices. Decode speed is mostly limited by "
+    "how many bytes of weights and cache must be streamed for every generated token. "
+)
+BENCH_QUESTION = "\n\nWrite a long, detailed essay expanding on the text above."
 
 
 class Engine:
@@ -231,7 +229,7 @@ class Engine:
 
         total_bytes = _param_bytes(model)
         has_experts = bool(find_expert_modules(model))
-        min_kv = _kv_estimate_per_token(config, opts.kv_bits) * min(plain_limit, 32768)
+        min_kv = kv_estimate_per_token(config, opts.kv_bits) * min(plain_limit, 32768)
         fits = total_bytes + draft_bytes + reserve + min_kv <= budget
         stream = opts.stream_experts == "on" or (opts.stream_experts == "auto" and not fits and has_experts)
         if stream and not has_experts:
@@ -461,6 +459,50 @@ class Engine:
                 if use_prefix and (draft is not None or self.draft_model is None):
                     self.prefix.put(key, tokens + generated, cache)
             yield Chunk("", finish, m)
+
+    # ------------------------------------------------------------ benchmark
+    def benchmark(self, prompt_tokens: int = 1024, gen_tokens: int = 128, use_draft: bool = True) -> dict:
+        """Fresh-cache prefill + greedy decode of a fixed workload, for comparing models/settings."""
+        if not self.loaded:
+            raise NotLoaded("No model loaded")
+        prompt_tokens = max(16, min(int(prompt_tokens), self.plan.max_context - gen_tokens - 64))
+        unit = self.encode_text(BENCH_PASSAGE)
+        bos = getattr(self.tokenizer, "bos_token_id", None)
+        if bos is not None and unit and unit[0] == bos:
+            unit = unit[1:]
+        filler = (unit * (prompt_tokens // len(unit) + 1))[:prompt_tokens]
+        messages = [{"role": "user", "content": self.tokenizer.decode(filler) + BENCH_QUESTION}]
+        tokens = self.encode_chat(messages, {"enable_thinking": False})
+        params = GenerationParams(max_tokens=gen_tokens, temperature=0.0, use_prefix_cache=False,
+                                  use_draft=use_draft)
+        st = self.streaming.cache.stats if self.streaming else None
+        before = (st.hits, st.misses) if st else (0, 0)
+        m = None
+        for chunk in self.generate(tokens, params):
+            m = chunk.metrics or m
+        hit_rate = None
+        if st:
+            hits, misses = st.hits - before[0], st.misses - before[1]
+            hit_rate = round(hits / (hits + misses), 4) if hits + misses else 0.0
+        return {
+            "time": time.time(),
+            "model": self.options.model,
+            "prompt_tokens": m.prompt_tokens,
+            "completion_tokens": m.completion_tokens,
+            "ttft_ms": round(m.ttft_ms, 1),
+            "prompt_tps": round(m.prompt_tps, 1),
+            "decode_tps": round(m.decode_tps, 2),
+            "peak_memory_gb": m.peak_memory_gb,
+            "draft_model": self.options.draft_model if use_draft else None,
+            "draft_accepted": m.draft_accepted,
+            "kv_bits": self.options.kv_bits,
+            "max_context": self.plan.max_context,
+            "expert_streaming": st is not None,
+            "expert_hit_rate": hit_rate,
+            "device": "metal" if mx.metal.is_available() else "cpu",
+            "chip": self.hw.chip,
+            "mlx_version": mx.__version__,
+        }
 
     # ---------------------------------------------------------------- info
     def info(self) -> dict:

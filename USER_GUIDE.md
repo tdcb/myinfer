@@ -9,8 +9,8 @@ python -m m5engine serve --port 8080          # open http://127.0.0.1:8080
 ```
 
 Models can be a local MLX directory or a Hugging Face repo id; repo ids are
-downloaded on first use. The UI lists models found in `./models` and in the
-Hugging Face cache, and has one-click downloads for the recommended models.
+downloaded on first use. The **Models** tab in the UI manages everything on disk
+(see section 5).
 
 ## 2. Load options
 
@@ -73,7 +73,29 @@ prefetch use and read throughput. Speed depends on the hit rate and SSD
 bandwidth. A bigger `expert_cache_gb` raises the hit rate but leaves less
 memory for context; lower-bit checkpoints (e.g. 3-bit) fit more experts.
 
-## 5. API
+## 5. Managing models (Models tab)
+
+- **Get models**: search MLX text-generation models on Hugging Face, or show the
+  curated list. Each result shows the download size, whether it fits in memory,
+  streams experts from SSD, or is too large, and an estimated maximum context.
+  The estimate comes from `config.json` before downloading; the real plan is
+  computed after loading. Downloads go to `--models-dir` (default `./models`),
+  show progress, and can be cancelled. Partial files resume when you retry.
+- **Benchmark**: runs a fixed workload with a fresh cache (Quick 512 / Standard
+  2K / Long-context 16K prompt tokens, greedy decode) and records decode tok/s,
+  prefill tok/s, TTFT and peak memory, with the KV precision, draft model and
+  SSD expert hit rate. It loads the model with the current Advanced options if
+  it isn't already loaded, which replaces the loaded model. Results are kept in
+  `<models-dir>/benchmarks.json` (last 20 per model) and shown under History.
+- **Check update / Update**: compares the local revision with the latest commit
+  on the Hub. Updating fetches only changed files and deletes files the new
+  revision no longer has (for example after re-sharding). Models downloaded by
+  M5Engine record their source in `.m5engine.json`.
+- **Delete**: removes the model from disk (models in `--models-dir`, or all
+  revisions of a repo in the Hugging Face cache) and its benchmark history.
+  The loaded model can't be deleted or updated until you unload it.
+
+## 6. API
 
 | Endpoint | Purpose |
 |---|---|
@@ -82,8 +104,11 @@ memory for context; lower-bit checkpoints (e.g. 3-bit) fit more experts.
 | `GET /v1/models` | Loaded model and its `max_context` |
 | `POST /v1/models/load` / `unload` | Load (async; add `"sync": true` to wait) / unload |
 | `GET /v1/engine/stats` | Hardware, memory, context plan, expert streaming, last request metrics |
-| `GET /v1/models/local`, `/v1/models/recommendations` | Local models and recommendations |
-| `POST /v1/models/download`, `GET /v1/models/download/status` | Hugging Face downloads |
+| `GET /v1/models/local`, `/v1/models/recommendations` | Installed models (with latest benchmark, disk free) and recommendations |
+| `GET /v1/models/hub/search?q=`, `/v1/models/hub/info?repo_id=` | Search the Hub; size, revision, fit and context estimate for a repo |
+| `POST /v1/models/download`, `/download/cancel`, `GET /v1/models/download/status` | Hugging Face downloads |
+| `POST /v1/models/check_updates` (`{"id"}` optional), `/v1/models/upgrade`, `/v1/models/delete` | Update checks, upgrades and deletion by local model `id` |
+| `POST /v1/models/benchmark`, `GET /v1/models/benchmark/status`, `/v1/models/benchmarks?id=` | Run a benchmark (`id`, `prompt_tokens`, `gen_tokens`), its progress, and history |
 | `POST /v1/prefix_cache/clear` | Drop cached conversations |
 
 Extra request fields: `prefix_cache` (bool) and `speculative` (bool). The
@@ -101,7 +126,7 @@ for chunk in client.chat.completions.create(
     print(chunk.choices[0].delta.content or "" if chunk.choices else "", end="")
 ```
 
-## 6. Tips
+## 7. Tips
 
 - MoE models with few active parameters (Qwen3-30B-A3B, Qwen3-Next-80B-A3B)
   decode much faster than dense 32B models at similar quality.

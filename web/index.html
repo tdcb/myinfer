@@ -59,6 +59,34 @@
   .pill { font-size:10px; padding:1px 6px; border-radius:999px; border:1px solid var(--border); color:var(--text-muted); white-space:nowrap; }
   .pill.fit { color:var(--green); } .pill.stream { color:var(--purple); } .pill.no { color:var(--red); }
   .err { color:var(--red); font-size:11px; white-space:pre-wrap; }
+  details.adv summary { cursor:pointer; font-size:11px; color:var(--text-muted); padding:2px 0; }
+  details.adv[open] summary { margin-bottom:6px; }
+  details.adv > div { display:flex; flex-direction:column; gap:8px; }
+  .tabs { display:flex; gap:4px; margin-right:8px; }
+  .tab { background:transparent; border:1px solid var(--border); color:var(--text-muted); }
+  .tab.active { background:var(--bg-card); color:var(--text-main); border-color:var(--accent); }
+  .view { flex:1; display:flex; flex-direction:column; min-height:0; }
+  #models-view { overflow-y:auto; padding:18px; gap:16px; }
+  .mm-head { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+  .mm-head h2 { font-size:14px; }
+  .mm-tools { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  table.mm { width:100%; border-collapse:collapse; font-size:12px; }
+  table.mm th { text-align:left; font-size:10.5px; text-transform:uppercase; letter-spacing:.6px; color:var(--text-muted); font-weight:600; padding:6px 8px; border-bottom:1px solid var(--border); }
+  table.mm td { padding:7px 8px; border-bottom:1px solid var(--border); vertical-align:middle; }
+  table.mm td.num { font-family:var(--mono); text-align:right; white-space:nowrap; }
+  table.mm tr.hist td { background:var(--bg-input); padding:8px 12px; }
+  .mname { font-weight:600; }
+  .msub { font-family:var(--mono); font-size:10.5px; color:var(--text-muted); word-break:break-all; }
+  .actions { display:flex; gap:6px; justify-content:flex-end; flex-wrap:wrap; }
+  .actions button { padding:4px 8px; font-size:11px; }
+  button.danger { background:transparent; border:1px solid rgba(239,68,68,.5); color:var(--red); }
+  button.link { background:none; border:0; color:var(--accent); padding:0; font-weight:500; }
+  .pill.loaded { color:var(--green); border-color:rgba(16,185,129,.4); }
+  .pill.update { color:var(--amber); border-color:rgba(245,158,11,.5); }
+  .progress { height:6px; background:var(--bg-input); border:1px solid var(--border); border-radius:3px; overflow:hidden; min-width:140px; }
+  .progress div { height:100%; background:var(--accent); }
+  .notice { font-size:11.5px; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg-card); }
+  .notice.error { color:var(--red); border-color:rgba(239,68,68,.4); }
 </style>
 </head>
 <body>
@@ -79,6 +107,7 @@
       <input id="model" list="local-models" placeholder="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit" />
       <datalist id="local-models"></datalist>
     </label>
+    <details class="adv"><summary>Advanced options</summary><div>
     <div class="row">
       <label>KV cache
         <select id="kv_bits"><option value="8" selected>8-bit</option><option value="4">4-bit (max context)</option><option value="0">fp16</option></select>
@@ -98,6 +127,7 @@
       <label>Expert cache GB (blank = auto)<input id="expert_cache_gb" type="number" step="1" /></label>
     </div>
     <label>Draft model for speculative decoding (optional)<input id="draft_model" list="local-models" placeholder="mlx-community/Qwen3-0.6B-4bit" /></label>
+    </div></details>
     <div class="row">
       <button id="btn-load">Load</button>
       <button id="btn-unload" class="secondary">Unload</button>
@@ -124,15 +154,11 @@
     <div class="kv" id="stream"></div>
   </div>
 
-  <div class="card">
-    <div class="section-title">Recommended models</div>
-    <div id="recos" class="muted">Loading…</div>
-    <div id="downloads" class="kv"></div>
-  </div>
 </aside>
 
 <main class="main">
   <div class="topbar">
+    <div class="tabs"><button class="tab active" data-view="chat">Chat</button><button class="tab" data-view="models">Models</button></div>
     <div class="metric"><b id="m-model">—</b><span>model</span></div>
     <div class="metric"><b id="m-ttft">—</b><span>TTFT</span></div>
     <div class="metric"><b id="m-ptps">—</b><span>prefill tok/s</span></div>
@@ -142,6 +168,7 @@
     <div class="metric"><b id="m-peak">—</b><span>peak GB</span></div>
     <div class="metric"><b id="m-thermal">—</b><span>thermal</span></div>
   </div>
+  <section class="view" id="chat-view">
   <div id="chat"></div>
   <div class="composer">
     <div class="composer-opts">
@@ -157,6 +184,54 @@
       <button id="btn-send">Send</button>
     </div>
   </div>
+  </section>
+
+  <section class="view" id="models-view" style="display:none">
+    <div id="mm-notice"></div>
+    <div class="card">
+      <div class="mm-head">
+        <h2>Installed models</h2>
+        <div class="mm-tools">
+          <span class="muted" id="mm-disk"></span>
+          <label style="flex-direction:row;align-items:center;gap:6px">Benchmark
+            <select id="bench-preset">
+              <option value="64,8">Smoke test (64 prompt · 8 out)</option>
+              <option value="512,64">Quick (512 prompt · 64 out)</option>
+              <option value="2048,128" selected>Standard (2K prompt · 128 out)</option>
+              <option value="16384,128">Long context (16K prompt · 128 out)</option>
+            </select>
+          </label>
+          <button class="secondary" id="btn-check-all">Check for updates</button>
+        </div>
+      </div>
+      <div id="bench-status" class="muted"></div>
+      <table class="mm">
+        <thead><tr><th>Model</th><th>Type</th><th style="text-align:right">Size</th><th style="text-align:right">Decode tok/s</th><th style="text-align:right">Prefill tok/s</th><th style="text-align:right">TTFT</th><th style="text-align:right">Peak GB</th><th></th></tr></thead>
+        <tbody id="installed"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="card" id="downloads-card" style="display:none">
+      <div class="section-title">Downloads</div>
+      <table class="mm"><tbody id="downloads"></tbody></table>
+    </div>
+
+    <div class="card">
+      <div class="mm-head">
+        <h2>Get models</h2>
+        <div class="mm-tools">
+          <input id="hub-q" placeholder="Search MLX models on Hugging Face (e.g. qwen3 30b 4bit)" style="width:340px" />
+          <button id="btn-search">Search</button>
+          <button class="secondary" id="btn-recos">Recommended</button>
+        </div>
+      </div>
+      <div class="muted" id="hub-note"></div>
+      <table class="mm">
+        <thead><tr><th>Model</th><th>Type</th><th style="text-align:right">Download</th><th>Fit on this Mac</th><th style="text-align:right">Est. max context</th><th style="text-align:right">Downloads</th><th></th></tr></thead>
+        <tbody id="hub"></tbody>
+      </table>
+    </div>
+  </section>
 </main>
 
 <script>
@@ -181,6 +256,8 @@ async function refresh() {
   kv($('hw'), [['chip', h.chip], ['gpu', h.metal ? h.gpu : 'CPU (no Metal)'], ['unified memory', gb(h.total_ram_gb)],
     ['GPU budget', gb(h.gpu_limit_gb)], ['active / peak', `${gb(s.memory.active_gb)} / ${gb(s.memory.peak_gb)}`], ['MLX', h.mlx_version]]);
   $('m-thermal').textContent = h.thermal;
+  const mp = s.model ? s.model.path : null;
+  if (mp !== lastModelPath) { lastModelPath = mp; refreshModels(); }
   if (!s.model) {
     $('m-model').textContent = '—'; $('ctx-max').textContent = '—'; $('ctx-why').textContent = 'No model loaded';
     $('ctx').innerHTML = ''; $('mem-bar').innerHTML = ''; $('stream-card').style.display = 'none';
@@ -211,32 +288,242 @@ async function refresh() {
   }
 }
 
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const post = (url, body) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+const ago = t => { if (!t) return ''; const d = (Date.now() / 1000 - t); return d < 3600 ? `${Math.max(1, Math.round(d / 60))} min ago` : d < 86400 ? `${Math.round(d / 3600)} h ago` : new Date(t * 1000).toLocaleDateString(); };
+let installed = [];
+let diskFree = null;
+let lastModelPath = null;
+let updates = {};
+let openHist = new Set();
+let hubRows = [];
+const hubInfo = {};
+
+function notice(msg, isErr) {
+  $('mm-notice').innerHTML = msg ? `<div class="notice ${isErr ? 'error' : ''}">${esc(msg)}</div>` : '';
+  if (msg && !isErr) setTimeout(() => { if ($('mm-notice').textContent === msg) notice(''); }, 6000);
+}
+async function apiError(r) { try { return (await r.json()).error.message; } catch { return `HTTP ${r.status}`; } }
+const typeLabel = m => `${m.moe ? 'MoE' : 'Dense'}${m.bits ? ` · ${m.bits}-bit` : ''}${m.model_type ? ` · ${esc(m.model_type)}` : ''}`;
+
 async function refreshModels() {
+  let local;
+  try { local = await (await fetch('/v1/models/local')).json(); } catch { return; }
+  installed = local.data;
+  diskFree = local.disk_free_gb;
+  $('local-models').innerHTML = installed.map(m => `<option value="${esc(m.id)}">${m.size_gb} GB${m.moe ? ' · MoE' : ''}</option>`).join('');
+  $('mm-disk').textContent = `${installed.length} installed · ${local.disk_free_gb} GB free on disk`;
+  renderInstalled();
+  renderHub();
+}
+
+function renderInstalled() {
+  if (!installed.length) { $('installed').innerHTML = '<tr><td colspan="8" class="muted">No models yet. Download one below.</td></tr>'; return; }
+  const benchBusy = ['loading', 'running'].includes(benchJob.state);
+  $('installed').innerHTML = installed.map((m, i) => {
+    const b = m.benchmark, u = updates[m.id];
+    const pills = (m.loaded ? '<span class="pill loaded">loaded</span> ' : '') +
+      (m.incomplete ? '<span class="pill no">incomplete download</span> ' : '') +
+      (u && u.status === 'update_available' ? '<span class="pill update">update available</span> ' : '') +
+      (u && u.status === 'up_to_date' ? '<span class="pill">up to date</span> ' : '') +
+      (u && (u.status === 'unknown' || u.status === 'error') ? `<span class="pill" title="${esc(u.reason || '')}">update status unknown</span> ` : '');
+    const upd = u && u.status === 'update_available'
+      ? `<button data-act="upgrade" data-i="${i}">Update</button>`
+      : `<button class="secondary" data-act="check" data-i="${i}" ${m.repo_id ? '' : 'disabled title="Source repo unknown"'}>Check update</button>`;
+    let row = `<tr>
+      <td><div class="mname">${esc(m.name)} ${pills}</div><div class="msub" title="${esc(m.path)}">${esc(m.repo_id || m.path)}${m.source === 'hf_cache' ? ' · HF cache' : ''}</div></td>
+      <td>${typeLabel(m)}</td>
+      <td class="num">${gb(m.disk_gb ?? m.size_gb)}</td>
+      <td class="num">${b ? b.decode_tps.toFixed(1) : '—'}</td>
+      <td class="num">${b ? fmt(Math.round(b.prompt_tps)) : '—'}</td>
+      <td class="num">${b ? fmt(Math.round(b.ttft_ms)) + ' ms' : '—'}</td>
+      <td class="num">${b ? b.peak_memory_gb : '—'}</td>
+      <td><div class="actions">
+        ${m.incomplete ? (m.repo_id ? `<button data-act="resume" data-i="${i}">Resume download</button>` : '') : `
+        ${m.loaded ? '' : `<button class="secondary" data-act="load" data-i="${i}">Load</button>`}
+        <button class="secondary" data-act="bench" data-i="${i}" ${benchBusy ? 'disabled' : ''}>Benchmark</button>`}
+        ${upd}
+        <button class="danger" data-act="delete" data-i="${i}" ${m.loaded ? 'disabled title="Unload it first"' : ''}>Delete</button>
+        ${m.benchmark_runs ? `<button class="link" data-act="hist" data-i="${i}">${openHist.has(m.id) ? 'Hide' : 'History'} (${m.benchmark_runs})</button>` : ''}
+      </div></td></tr>`;
+    if (openHist.has(m.id)) row += `<tr class="hist"><td colspan="8" id="hist-${i}" class="muted">Loading…</td></tr>`;
+    return row;
+  }).join('');
+  installed.forEach((m, i) => { if (openHist.has(m.id)) loadHistory(m, i); });
+}
+
+async function loadHistory(m, i) {
+  const d = await (await fetch('/v1/models/benchmarks?id=' + encodeURIComponent(m.id))).json();
+  const el = $('hist-' + i); if (!el) return;
+  el.innerHTML = `<table class="mm"><thead><tr><th>When</th><th style="text-align:right">Prompt / out</th><th style="text-align:right">Decode tok/s</th><th style="text-align:right">Prefill tok/s</th><th style="text-align:right">TTFT</th><th style="text-align:right">Peak GB</th><th>Settings</th><th>Device</th></tr></thead><tbody>` +
+    d.data.slice().reverse().map(r => `<tr><td>${ago(r.time)}</td><td class="num">${fmt(r.prompt_tokens)} / ${fmt(r.completion_tokens)}</td>
+      <td class="num">${r.decode_tps.toFixed(1)}</td><td class="num">${fmt(Math.round(r.prompt_tps))}</td><td class="num">${fmt(Math.round(r.ttft_ms))} ms</td>
+      <td class="num">${r.peak_memory_gb}</td>
+      <td>${r.kv_bits ? r.kv_bits + '-bit KV' : 'fp16 KV'}${r.draft_model ? ` · draft ${esc(r.draft_model.split('/').pop())} (${fmt(r.draft_accepted)} accepted)` : ''}${r.expert_streaming ? ` · SSD experts, ${(r.expert_hit_rate * 100).toFixed(0)}% hit` : ''}</td>
+      <td>${esc(r.chip)} · ${r.device}</td></tr>`).join('') + '</tbody></table>';
+}
+
+$('installed').onclick = async e => {
+  const btn = e.target.closest('button[data-act]'); if (!btn) return;
+  const m = installed[Number(btn.dataset.i)]; if (!m) return;
+  const act = btn.dataset.act;
+  if (act === 'hist') { openHist.has(m.id) ? openHist.delete(m.id) : openHist.add(m.id); return renderInstalled(); }
+  if (act === 'load') { $('model').value = m.id; showView('chat'); return $('btn-load').onclick(); }
+  if (act === 'bench') return startBenchmark(m);
+  if (act === 'resume') return download(m.repo_id);
+  if (act === 'check') return checkUpdates(m.id);
+  if (act === 'upgrade') {
+    if (!confirm(`Download the latest ${m.name} from ${m.repo_id}? Only changed files are fetched.`)) return;
+    const r = await post('/v1/models/upgrade', { id: m.id });
+    if (!r.ok) return notice(await apiError(r), true);
+    delete updates[m.id]; notice(`Updating ${m.name}…`); return refreshDownloads();
+  }
+  if (act === 'delete') {
+    if (!confirm(`Delete ${m.name} (${gb(m.disk_gb ?? m.size_gb)}) from disk? Its benchmark history is removed too.`)) return;
+    const r = await post('/v1/models/delete', { id: m.id });
+    if (!r.ok) return notice(await apiError(r), true);
+    const d = await r.json(); notice(`Deleted ${m.name}, freed ${gb(d.freed_gb)}`); refreshModels();
+  }
+};
+
+async function checkUpdates(id) {
+  $('btn-check-all').disabled = true; notice(id ? 'Checking for an update…' : 'Checking all models for updates…');
   try {
-    const local = await (await fetch('/v1/models/local')).json();
-    $('local-models').innerHTML = local.data.map(m => `<option value="${m.id}">${m.size_gb} GB${m.moe ? ' · MoE' : ''}</option>`).join('');
-    const r = await (await fetch('/v1/models/recommendations')).json();
-    $('recos').innerHTML = `<div class="muted">GPU budget ${r.budget_gb} GB</div>` + r.data.map(m => {
-      const cls = m.fit.startsWith('fits') ? 'fit' : m.fit.startsWith('streams') ? 'stream' : m.fit.startsWith('too') ? 'no' : '';
-      return `<div class="reco"><div><div class="name">${m.repo_id}</div><div>${m.kind} · ${m.params_b}B${m.kind === 'moe' ? ` (${m.active_b}B active)` : ''} · ${m.size_gb} GB</div></div>
-        <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end"><span class="pill ${cls}">${m.fit}</span>
-        <button class="secondary" data-repo="${m.repo_id}" ${cls === 'no' ? 'disabled' : ''}>Download</button></div></div>`;
-    }).join('');
-    $('recos').querySelectorAll('button[data-repo]').forEach(b => b.onclick = () => download(b.dataset.repo));
-  } catch (e) { $('recos').textContent = 'Could not load recommendations'; }
+    const r = await post('/v1/models/check_updates', id ? { id } : {});
+    if (!r.ok) return notice(await apiError(r), true);
+    for (const u of (await r.json()).data) updates[u.id] = u;
+    const n = Object.values(updates).filter(u => u.status === 'update_available').length;
+    notice(n ? `${n} update${n > 1 ? 's' : ''} available` : 'Everything checked is up to date');
+    renderInstalled();
+  } finally { $('btn-check-all').disabled = false; }
+}
+$('btn-check-all').onclick = () => checkUpdates();
+
+let benchJob = { state: 'idle' };
+async function startBenchmark(m) {
+  const [p, g] = $('bench-preset').value.split(',').map(Number);
+  const loaded = installed.find(x => x.loaded);
+  if (!m.loaded && loaded && !confirm(`Benchmarking ${m.name} unloads ${loaded.name}. Continue?`)) return;
+  const r = await post('/v1/models/benchmark', { id: m.id, prompt_tokens: p, gen_tokens: g });
+  if (!r.ok) return notice(await apiError(r), true);
+  benchJob = await r.json(); pollBenchmark();
+}
+async function pollBenchmark() {
+  benchJob = await (await fetch('/v1/models/benchmark/status')).json();
+  const name = (benchJob.model_id || '').split('/').pop();
+  const el = $('bench-status');
+  if (benchJob.state === 'loading' || benchJob.state === 'running') {
+    el.textContent = `${benchJob.state === 'loading' ? 'Loading' : 'Benchmarking'} ${name} (${fmt(benchJob.prompt_tokens)}-token prompt, ${benchJob.gen_tokens} tokens out)… ${Math.round(Date.now() / 1000 - benchJob.started)} s`;
+    renderInstalled(); setTimeout(pollBenchmark, 1500); return;
+  }
+  if (benchJob.state === 'done') { const b = benchJob.result; el.textContent = `Last benchmark: ${name} — ${b.decode_tps.toFixed(1)} tok/s decode, ${Math.round(b.prompt_tps)} tok/s prefill, ${Math.round(b.ttft_ms)} ms TTFT, ${b.peak_memory_gb} GB peak (${b.device})`; }
+  else if (benchJob.state === 'error') { el.innerHTML = `<span class="err">Benchmark of ${esc(name)} failed: ${esc(benchJob.error)}</span>`; }
+  refreshModels();
 }
 
 async function refreshDownloads() {
-  const d = await (await fetch('/v1/models/download/status')).json();
-  kv($('downloads'), d.data.map(j => [j.repo_id.split('/').pop(),
-    j.state === 'downloading' ? `${j.downloaded_gb}${j.total_gb ? ' / ' + j.total_gb : ''} GB` : j.state === 'error' ? 'error: ' + j.error : j.state]));
-  if (d.data.some(j => j.state === 'downloading')) setTimeout(refreshDownloads, 1500); else refreshModels();
+  let d; try { d = await (await fetch('/v1/models/download/status')).json(); } catch { return; }
+  const jobs = d.data.filter(j => j.state !== 'done' || Date.now() / 1000 - j.finished < 30);
+  $('downloads-card').style.display = jobs.length ? '' : 'none';
+  $('downloads').innerHTML = jobs.map(j => {
+    const pct = j.total_gb ? Math.min(100, j.downloaded_gb / j.total_gb * 100) : 0;
+    const status = j.state === 'downloading' ? `${j.downloaded_gb}${j.total_gb ? ' / ' + j.total_gb : ''} GB`
+      : j.state === 'error' ? `<span class="err">${esc(j.error)}</span>` : j.state;
+    return `<tr><td><div class="mname">${esc(j.repo_id)}</div><div class="msub">${j.kind === 'upgrade' ? 'update' : 'download'}</div></td>
+      <td style="width:40%"><div class="progress"><div style="width:${j.state === 'done' ? 100 : pct}%"></div></div></td>
+      <td class="num">${status}</td>
+      <td><div class="actions">${j.state === 'downloading' ? `<button class="danger" data-cancel="${esc(j.repo_id)}">Cancel</button>`
+        : j.state === 'cancelled' || j.state === 'error' ? `<button class="secondary" data-retry="${esc(j.repo_id)}">Resume</button><button class="danger" data-discard="${esc(j.repo_id)}">Discard</button>` : ''}</div></td></tr>`;
+  }).join('');
+  const active = d.data.some(j => j.state === 'downloading');
+  if (active) setTimeout(refreshDownloads, 1500);
+  if (active !== refreshDownloads.wasActive) { refreshDownloads.wasActive = active; if (!active) refreshModels(); }
 }
+$('downloads').onclick = async e => {
+  const c = e.target.closest('button[data-cancel]'), r = e.target.closest('button[data-retry]'), x = e.target.closest('button[data-discard]');
+  if (c) { await post('/v1/models/download/cancel', { repo_id: c.dataset.cancel }); refreshDownloads(); }
+  if (x) {
+    const resp = await post('/v1/models/download/discard', { repo_id: x.dataset.discard });
+    if (!resp.ok) return notice(await apiError(resp), true);
+    notice(`Discarded partial download, freed ${gb((await resp.json()).freed_gb)}`); refreshDownloads(); refreshModels();
+  }
+  if (r) download(r.dataset.retry);
+};
 
 async function download(repo) {
-  await fetch('/v1/models/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repo_id: repo }) });
-  refreshDownloads();
+  const info = hubInfo[repo];
+  if (info && info.download_gb && diskFree != null && info.download_gb > diskFree)
+    return notice(`${repo} needs ${info.download_gb} GB but only ${diskFree} GB is free on disk.`, true);
+  const r = await post('/v1/models/download', { repo_id: repo });
+  if (!r.ok) return notice(await apiError(r), true);
+  refreshDownloads.wasActive = false; refreshDownloads();
 }
+
+function renderHub() {
+  const installedRepos = new Set(installed.map(m => m.repo_id).filter(Boolean));
+  $('hub').innerHTML = hubRows.map(h => {
+    const i = hubInfo[h.repo_id];
+    const fit = i ? (i.error ? `<span class="muted">${esc(i.error)}</span>` : `<span class="pill ${i.fit.startsWith('fits') ? 'fit' : i.fit.startsWith('streams') ? 'stream' : 'no'}">${esc(i.fit)}</span>`) : '<span class="muted">…</span>';
+    const kind = h.kind ? `${h.kind === 'moe' ? 'MoE' : h.kind === 'draft' ? 'Draft' : 'Dense'} · ${h.params_b}B${h.kind === 'moe' ? ` (${h.active_b}B active)` : ''}`
+      : i && !i.error ? typeLabel(i) : '';
+    const inst = installedRepos.has(h.repo_id);
+    const tooBig = i && !i.error && i.fit === 'too large';
+    return `<tr><td><div class="mname">${esc(h.repo_id.split('/').pop())}</div><div class="msub">${esc(h.repo_id)}</div></td>
+      <td>${kind}</td>
+      <td class="num">${i && !i.error ? gb(i.download_gb) : h.size_gb ? '≈' + gb(h.size_gb) : '—'}</td>
+      <td>${fit}</td>
+      <td class="num">${i && i.est_max_context ? '≈' + fmt(i.est_max_context) : '—'}</td>
+      <td class="num">${h.downloads != null ? fmt(h.downloads) : i && i.downloads != null ? fmt(i.downloads) : '—'}</td>
+      <td><div class="actions">${inst ? '<span class="pill loaded">installed</span>' : `<button data-dl="${esc(h.repo_id)}" ${tooBig ? 'disabled title="Too large for this Mac"' : ''}>Download</button>`}</div></td></tr>`;
+  }).join('') || '<tr><td colspan="7" class="muted">No results</td></tr>';
+}
+$('hub').onclick = e => { const b = e.target.closest('button[data-dl]'); if (b) download(b.dataset.dl); };
+
+async function fetchHubInfo(rows) {
+  const queue = rows.filter(h => !hubInfo[h.repo_id]);
+  const worker = async () => {
+    while (queue.length) {
+      const h = queue.shift();
+      try {
+        const r = await fetch('/v1/models/hub/info?repo_id=' + encodeURIComponent(h.repo_id) + '&kv_bits=' + $('kv_bits').value);
+        hubInfo[h.repo_id] = r.ok ? await r.json() : { error: await apiError(r) };
+      } catch (e) { hubInfo[h.repo_id] = { error: String(e) }; }
+      renderHub();
+    }
+  };
+  await Promise.all([1, 2, 3, 4].map(worker));
+}
+
+async function showRecommendations() {
+  $('hub-note').textContent = 'Loading recommendations…';
+  try {
+    const r = await (await fetch('/v1/models/recommendations')).json();
+    hubRows = r.data;
+    $('hub-note').textContent = `Curated for this Mac · GPU budget ${r.budget_gb} GB · context estimates assume ${$('kv_bits').selectedOptions[0].text} KV cache`;
+    renderHub(); fetchHubInfo(hubRows);
+  } catch { $('hub-note').textContent = 'Could not load recommendations'; }
+}
+async function searchHub() {
+  const q = $('hub-q').value.trim();
+  if (!q) return showRecommendations();
+  $('hub-note').textContent = `Searching for “${q}”…`;
+  const r = await fetch('/v1/models/hub/search?q=' + encodeURIComponent(q));
+  if (!r.ok) { $('hub-note').textContent = ''; return notice(await apiError(r), true); }
+  hubRows = (await r.json()).data;
+  $('hub-note').textContent = `${hubRows.length} MLX text-generation models matching “${q}”, most downloaded first`;
+  renderHub(); fetchHubInfo(hubRows);
+}
+$('btn-search').onclick = searchHub;
+$('btn-recos').onclick = () => { $('hub-q').value = ''; showRecommendations(); };
+$('hub-q').addEventListener('keydown', e => { if (e.key === 'Enter') searchHub(); });
+
+function showView(v) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === v));
+  $('chat-view').style.display = v === 'chat' ? '' : 'none';
+  $('models-view').style.display = v === 'models' ? '' : 'none';
+  if (v === 'models') refreshModels();
+}
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => showView(t.dataset.view));
 
 $('btn-load').onclick = async () => {
   const body = { model: $('model').value.trim() };
@@ -297,7 +584,7 @@ async function send() {
 $('btn-send').onclick = send;
 $('prompt').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
 
-refresh(); refreshModels(); refreshDownloads();
+refresh(); refreshModels(); refreshDownloads(); showRecommendations(); pollBenchmark();
 setInterval(refresh, 2000);
 </script>
 </body>

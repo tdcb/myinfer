@@ -159,6 +159,17 @@ class ContextPlan:
         return d
 
 
+def kv_estimate_per_token(config: dict, kv_bits: int) -> float:
+    """Upper-bound KV bytes/token from the config, used only before weights are loaded."""
+    tc = config.get("text_config", config)
+    layers = int(tc.get("num_hidden_layers") or 32)
+    heads = int(tc.get("num_attention_heads") or 32)
+    kv_heads = int(tc.get("num_key_value_heads") or heads)
+    head_dim = int(tc.get("head_dim") or (int(tc.get("hidden_size") or 4096) // heads))
+    per_elem = 2.0 if not kv_bits else kv_bits / 8 + 4 / 64
+    return 2 * layers * kv_heads * head_dim * per_elem
+
+
 def reserve_bytes(budget: int, hidden_size: int, prefill_step: int) -> int:
     activations = prefill_step * max(hidden_size, 1) * 2 * 24
     return int(max(1.5 * GB, 0.04 * budget) + activations)

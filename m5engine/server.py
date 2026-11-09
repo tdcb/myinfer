@@ -10,9 +10,21 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlparse
 
 from .engine import Engine, EngineError, GenerationParams, LoadOptions
-from .models import Downloader, list_local_models, recommendations
+from .models import (
+    BenchmarkStore,
+    Downloader,
+    check_update,
+    delete_local_model,
+    disk_free_gb,
+    find_local,
+    hub_info,
+    list_local_models,
+    recommendations,
+    search_hub,
+)
 
 log = logging.getLogger("m5engine.server")
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -23,8 +35,106 @@ class App:
         self.engine = engine
         self.models_dir = models_dir
         self.downloader = Downloader(models_dir)
+        self.benchmarks = BenchmarkStore(models_dir)
+        self.bench_job: dict = {"state": "idle"}
         self.default_options = default_options or {}
         self.started = time.time()
+
+    # ------------------------------------------------------ model management
+    def is_loaded(self, entry: dict) -> bool:
+        mp = self.engine.model_path
+        return mp is not None and Path(entry["path"]).resolve() == mp.resolve()
+
+    def local_models(self) -> dict:
+        models = list_local_models(self.models_dir)
+        bench = self.benchmarks.all()
+        for m in models:
+            m["loaded"] = self.is_loaded(m)
+            runs = bench.get(m["id"], [])
+            m["benchmark"] = runs[-1] if runs else None
+            m["benchmark_runs"] = len(runs)
+        return {"data": models, "models_dir": str(self.models_dir.resolve()),
+                "disk_free_gb": disk_free_gb(self.models_dir)}
+
+    def _entry(self, model_id: Optional[str]) -> dict:
+        if not model_id:
+            raise EngineError("'id' is required")
+        try:
+            return find_local(self.models_dir, model_id)
+        except KeyError:
+            raise EngineError(f"No local model '{model_id}'")
+
+    def _not_loaded(self, entry: dict, action: str) -> None:
+        if self.is_loaded(entry) or self.bench_job.get("model_id") == entry["id"] and self.busy_bench():
+            raise EngineError(f"Unload {entry['name']} before you {action} it.")
+
+    def delete(self, model_id: str) -> dict:
+        entry = self._entry(model_id)
+        self._not_loaded(entry, "delete")
+        freed = delete_local_model(self.models_dir, entry)
+        self.benchmarks.forget(entry["id"])
+        return {"id": entry["id"], "deleted": True, "freed_gb": freed}
+
+    def check_updates(self, model_id: Optional[str]) -> list:
+        entries = [self._entry(model_id)] if model_id else list_local_models(self.models_dir)
+        out = []
+        for e in entries:
+            try:
+                out.append(check_update(e))
+            except Exception as ex:
+                out.append({"id": e["id"], "status": "error", "reason": str(ex)})
+        return out
+
+    def upgrade(self, model_id: str) -> dict:
+        entry = self._entry(model_id)
+        if not entry.get("repo_id"):
+            raise EngineError("This model's source repo is unknown, so it can't be upgraded. "
+                              "Download it again from the Hub instead.")
+        self._not_loaded(entry, "upgrade")
+        local = entry["path"] if entry["source"] == "models_dir" else None
+        return self.downloader.start(entry["repo_id"], local_dir=local, upgrade=True)
+
+    def busy_bench(self) -> bool:
+        return self.bench_job.get("state") in ("loading", "running")
+
+    def benchmark_async(self, body: dict) -> dict:
+        if self.busy_bench():
+            raise EngineError("A benchmark is already running")
+        model_id = body.get("id")
+        entry = self._entry(model_id) if model_id else None
+        if entry is None and not self.engine.loaded:
+            raise EngineError("Load a model or pass 'id' to benchmark")
+        prompt_tokens = int(body.get("prompt_tokens") or 1024)
+        gen_tokens = int(body.get("gen_tokens") or 128)
+        job = {"state": "running", "model_id": entry["id"] if entry else None, "started": time.time(),
+               "prompt_tokens": prompt_tokens, "gen_tokens": gen_tokens, "result": None, "error": None}
+        self.bench_job = job
+
+        def run():
+            try:
+                if entry is not None and not self.is_loaded(entry):
+                    job["state"] = "loading"
+                    load = {**self.default_options, **(body.get("load_options") or {}), "model": entry["path"]}
+                    self.engine.load(LoadOptions.from_dict(load))
+                    job["state"] = "running"
+                key = entry["id"] if entry else self._loaded_id()
+                job["model_id"] = key
+                result = self.engine.benchmark(prompt_tokens, gen_tokens, bool(body.get("speculative", True)))
+                self.benchmarks.add(key, result)
+                job["result"], job["state"] = result, "done"
+            except Exception as e:
+                log.error("Benchmark failed: %s", e)
+                job["error"], job["state"] = str(e), "error"
+            job["finished"] = time.time()
+
+        threading.Thread(target=run, daemon=True).start()
+        return job
+
+    def _loaded_id(self) -> str:
+        for m in list_local_models(self.models_dir):
+            if self.is_loaded(m):
+                return m["id"]
+        return self.engine.options.model
 
     def load_async(self, body: dict) -> None:
         opts = LoadOptions.from_dict({**self.default_options, **body})
@@ -101,7 +211,9 @@ def make_handler(app: App):
 
         # ----------------------------------------------------------- routes
         def do_GET(self):
-            path = self.path.split("?")[0]
+            url = urlparse(self.path)
+            path = url.path
+            q = {k: v[-1] for k, v in parse_qs(url.query).items()}
             try:
                 if path in ("/", "/index.html"):
                     return self._send(200, (WEB_DIR / "index.html").read_bytes(), "text/html; charset=utf-8")
@@ -117,7 +229,20 @@ def make_handler(app: App):
                 if path == "/v1/engine/stats":
                     return self._send(200, engine.info())
                 if path == "/v1/models/local":
-                    return self._send(200, {"data": list_local_models(app.models_dir)})
+                    return self._send(200, app.local_models())
+                if path == "/v1/models/hub/search":
+                    return self._send(200, {"data": search_hub(q.get("q", ""), int(q.get("limit", 25)))})
+                if path == "/v1/models/hub/info":
+                    if not q.get("repo_id"):
+                        raise EngineError("'repo_id' is required")
+                    kv = int(q.get("kv_bits", app.default_options.get("kv_bits", 8)))
+                    return self._send(200, hub_info(q["repo_id"], engine.budget_bytes(), kv))
+                if path == "/v1/models/benchmark/status":
+                    return self._send(200, app.bench_job)
+                if path == "/v1/models/benchmarks":
+                    if q.get("id"):
+                        return self._send(200, {"id": q["id"], "data": app.benchmarks.get(q["id"])})
+                    return self._send(200, {"data": app.benchmarks.all()})
                 if path == "/v1/models/download/status":
                     return self._send(200, {"data": app.downloader.status()})
                 if path == "/v1/models/recommendations":
@@ -151,6 +276,24 @@ def make_handler(app: App):
                     load = body.get("auto_load")
                     on_done = (lambda job: app.load_async({**body, "model": job["path"]})) if load else None
                     return self._send(202, app.downloader.start(repo, on_done))
+                if path == "/v1/models/download/cancel":
+                    try:
+                        return self._send(200, app.downloader.cancel(body.get("repo_id") or ""))
+                    except KeyError:
+                        raise EngineError("No active download for that repo")
+                if path == "/v1/models/download/discard":
+                    try:
+                        return self._send(200, app.downloader.discard(body.get("repo_id") or ""))
+                    except KeyError:
+                        raise EngineError("No cancelled or failed download for that repo")
+                if path == "/v1/models/delete":
+                    return self._send(200, app.delete(body.get("id")))
+                if path == "/v1/models/check_updates":
+                    return self._send(200, {"data": app.check_updates(body.get("id"))})
+                if path == "/v1/models/upgrade":
+                    return self._send(202, app.upgrade(body.get("id")))
+                if path == "/v1/models/benchmark":
+                    return self._send(202, app.benchmark_async(body))
                 if path == "/v1/prefix_cache/clear":
                     engine.prefix.clear()
                     return self._send(200, {"entries": 0})

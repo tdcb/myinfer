@@ -43,6 +43,11 @@ python -m m5engine plan --model mlx-community/Qwen3-32B-4bit
 
 `Launch_M5Engine_UI.command` sets up `.venv` and starts the server from Finder.
 
+The **Models** tab in the UI searches and downloads MLX models from Hugging Face
+(with a fit and context estimate for this Mac), benchmarks installed models and
+keeps their history, checks for and applies updates, and deletes models. See
+[USER_GUIDE.md](USER_GUIDE.md#5-managing-models-models-tab).
+
 ### Getting the most context
 
 The GPU budget defaults to Metal's recommended working set, which is about
@@ -82,7 +87,7 @@ m5engine/
   prefix_cache.py   longest-prefix KV reuse
   hardware.py       RAM / GPU working set / thermal state
   server.py         OpenAI-compatible HTTP server and control API
-  models.py         local models, downloads, recommendations
+  models.py         local models, Hub search, downloads, updates, deletion, benchmark history
 web/index.html      control panel
 tests/              unit tests (no downloads needed)
 tools/              API end-to-end check, downloader

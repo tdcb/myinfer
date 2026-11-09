@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
+import logging
+import shutil
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
+
+from .context import MAX_YARN_FACTOR, kv_estimate_per_token, native_context, reserve_bytes, yarn_capable
+
+log = logging.getLogger("m5engine.models")
 
 GB = 1024**3
+META_FILE = ".m5engine.json"
+BENCH_FILE = "benchmarks.json"
 
 ALLOW_PATTERNS = [
     "*.json", "model*.safetensors", "*.py", "tokenizer.model", "*.tiktoken",
@@ -37,7 +48,37 @@ def _dir_bytes(p: Path) -> int:
 
 
 def _is_model_dir(p: Path) -> bool:
-    return (p / "config.json").exists() and any(p.glob("model*.safetensors"))
+    return (p / "config.json").exists() and (
+        any(p.glob("model*.safetensors")) or (p / "model.safetensors.index.json").exists()
+    )
+
+
+def _wanted(name: str) -> bool:
+    return any(fnmatch.fnmatch(name, pat) for pat in ALLOW_PATTERNS)
+
+
+def _read_meta(p: Path) -> dict:
+    """Source repo/revision of a models-dir download (ours, or huggingface_hub's own metadata)."""
+    try:
+        return json.loads((p / META_FILE).read_text())
+    except Exception:
+        pass
+    hf_meta = p / ".cache" / "huggingface" / "download" / "config.json.metadata"
+    try:
+        return {"revision": hf_meta.read_text().splitlines()[0].strip()}
+    except Exception:
+        return {}
+
+
+def _write_meta(p: Path, meta: dict) -> None:
+    (p / META_FILE).write_text(json.dumps(meta, indent=2))
+
+
+def disk_free_gb(models_dir: Path) -> float:
+    target = models_dir if models_dir.exists() else models_dir.resolve().parent
+    while not target.exists():
+        target = target.parent
+    return round(shutil.disk_usage(target).free / GB, 1)
 
 
 def list_local_models(models_dir: Path) -> List[dict]:
@@ -45,78 +86,296 @@ def list_local_models(models_dir: Path) -> List[dict]:
     if models_dir.exists():
         for p in sorted(models_dir.iterdir()):
             if p.is_dir() and _is_model_dir(p):
-                found[str(p)] = _describe(p, str(p))
+                meta = _read_meta(p)
+                found[str(p)] = _describe(p, str(p), "models_dir", meta.get("repo_id"), meta.get("revision"),
+                                          meta.get("downloaded_at") or p.stat().st_mtime)
     try:
         from huggingface_hub import scan_cache_dir
 
         for repo in scan_cache_dir().repos:
             if repo.repo_type != "model":
                 continue
-            for rev in repo.revisions:
+            revs = sorted(repo.revisions, key=lambda r: r.last_modified, reverse=True)
+            for rev in revs:
                 if _is_model_dir(Path(rev.snapshot_path)):
-                    found.setdefault(repo.repo_id, _describe(Path(rev.snapshot_path), repo.repo_id))
+                    d = _describe(Path(rev.snapshot_path), repo.repo_id, "hf_cache", repo.repo_id,
+                                  rev.commit_hash, rev.last_modified)
+                    d["disk_gb"] = round(repo.size_on_disk / GB, 2)
+                    found.setdefault(repo.repo_id, d)
                     break
     except Exception:
         pass
     return list(found.values())
 
 
-def _describe(p: Path, model_id: str) -> dict:
+def _describe(p: Path, model_id: str, source: str = "models_dir", repo_id: Optional[str] = None,
+              revision: Optional[str] = None, modified: Optional[float] = None) -> dict:
     try:
         cfg = json.loads((p / "config.json").read_text())
     except Exception:
         cfg = {}
     size = sum(f.stat().st_size for f in p.glob("model*.safetensors"))
-    moe = any(k in cfg for k in ("num_experts", "n_routed_experts", "num_local_experts"))
+    tc = cfg.get("text_config", cfg)
+    moe = any(k in tc for k in ("num_experts", "n_routed_experts", "num_local_experts"))
+    native, _ = native_context(cfg) if cfg else (0, 0)
+    q = cfg.get("quantization") or {}
     return {
+        "incomplete": _missing_shards(p),
         "id": model_id,
+        "name": (repo_id or p.name).split("/")[-1],
         "path": str(p),
+        "source": source,
+        "repo_id": repo_id,
+        "revision": revision,
+        "modified": modified,
         "model_type": cfg.get("model_type"),
         "moe": moe,
         "size_gb": round(size / GB, 2),
-        "quantization": cfg.get("quantization"),
+        "disk_gb": round(_dir_bytes(p) / GB, 2) if source == "models_dir" else round(size / GB, 2),
+        "quantization": q or None,
+        "bits": q.get("bits"),
+        "native_context": native,
     }
 
 
+def _missing_shards(p: Path) -> bool:
+    try:
+        index = json.loads((p / "model.safetensors.index.json").read_text())
+    except Exception:
+        return False
+    return any(not (p / f).exists() for f in set(index.get("weight_map", {}).values()))
+
+
+def find_local(models_dir: Path, model_id: str) -> dict:
+    for m in list_local_models(models_dir):
+        if model_id in (m["id"], m["path"]):
+            return m
+    raise KeyError(model_id)
+
+
+def delete_local_model(models_dir: Path, entry: dict) -> float:
+    """Remove a downloaded model from disk; returns GB freed."""
+    if entry["source"] == "hf_cache":
+        from huggingface_hub import scan_cache_dir
+
+        cache = scan_cache_dir()
+        for repo in cache.repos:
+            if repo.repo_id == entry["repo_id"] and repo.repo_type == "model":
+                strategy = cache.delete_revisions(*[r.commit_hash for r in repo.revisions])
+                freed = strategy.expected_freed_size
+                strategy.execute()
+                return round(freed / GB, 2)
+        raise KeyError(entry["id"])
+    path = Path(entry["path"]).resolve()
+    root = models_dir.resolve()
+    if root not in path.parents:
+        raise PermissionError(f"{path} is outside the models directory {root}")
+    freed = _dir_bytes(path)
+    shutil.rmtree(path)
+    return round(freed / GB, 2)
+
+
+# ------------------------------------------------------------------- Hub
+_hub_cache: Dict[str, Tuple[float, dict]] = {}
+HUB_TTL = 600.0
+
+
+def _api():
+    from huggingface_hub import HfApi
+
+    return HfApi()
+
+
+def search_hub(query: str, limit: int = 25) -> List[dict]:
+    models = _api().list_models(
+        search=query or None, filter="mlx", pipeline_tag="text-generation", sort="downloads",
+        limit=limit, expand=["downloads", "likes", "lastModified"],
+    )
+    return [{"repo_id": m.id, "downloads": m.downloads, "likes": m.likes,
+             "last_modified": m.last_modified.isoformat() if m.last_modified else None} for m in models]
+
+
+def hub_info(repo_id: str, budget_bytes: int, kv_bits: int = 8) -> dict:
+    """Size, revision and a pre-download fit/context estimate for a Hub repo."""
+    now = time.time()
+    hit = _hub_cache.get(repo_id)
+    if hit and now - hit[0] < HUB_TTL:
+        base = hit[1]
+    else:
+        from huggingface_hub import hf_hub_download
+
+        info = _api().model_info(repo_id, files_metadata=True)
+        files = [s for s in info.siblings if _wanted(s.rfilename)]
+        cfg = json.loads(Path(hf_hub_download(repo_id, "config.json", revision=info.sha)).read_text())
+        weights = sum((s.size or 0) for s in files if s.rfilename.endswith(".safetensors"))
+        base = {
+            "repo_id": repo_id,
+            "sha": info.sha,
+            "last_modified": info.last_modified.isoformat() if info.last_modified else None,
+            "downloads": info.downloads,
+            "download_gb": round(sum((s.size or 0) for s in files) / GB, 2),
+            "weights_bytes": weights,
+            "config": cfg,
+        }
+        _hub_cache[repo_id] = (now, base)
+    out = {k: v for k, v in base.items() if k not in ("config", "weights_bytes")}
+    out.update(estimate_fit(base["config"], base["weights_bytes"], budget_bytes, kv_bits))
+    return out
+
+
+def estimate_fit(cfg: dict, weight_bytes: int, budget_bytes: int, kv_bits: int = 8) -> dict:
+    """Rough pre-download estimate; the real plan is computed after loading."""
+    tc = cfg.get("text_config", cfg)
+    moe = any(k in tc for k in ("num_experts", "n_routed_experts", "num_local_experts"))
+    native, plain = native_context(cfg)
+    q = cfg.get("quantization") or {}
+    hidden = int(tc.get("hidden_size") or 4096)
+    reserve = reserve_bytes(budget_bytes, hidden, 2048)
+    free = budget_bytes - weight_bytes - reserve
+    if free > 0:
+        fit = "fits in memory"
+    elif moe:
+        fit = "streams experts from SSD"
+    else:
+        fit = "too large"
+    est = None
+    if free > 0:
+        per_tok = kv_estimate_per_token(cfg, kv_bits)
+        mem = int(free // per_tok) // 256 * 256 if per_tok else plain
+        model_limit = int(native * MAX_YARN_FACTOR) if yarn_capable(cfg) else plain
+        est = max(0, min(mem, model_limit))
+    return {"moe": moe, "bits": q.get("bits"), "model_type": cfg.get("model_type"),
+            "size_gb": round(weight_bytes / GB, 2), "native_context": native,
+            "fit": fit, "est_max_context": est}
+
+
+def check_update(entry: dict) -> dict:
+    if not entry.get("repo_id"):
+        return {"id": entry["id"], "status": "unknown", "reason": "Source repo not recorded for this model"}
+    info = _api().model_info(entry["repo_id"])
+    local = entry.get("revision")
+    if not local:
+        status = "unknown"
+    else:
+        status = "up_to_date" if info.sha == local else "update_available"
+    return {"id": entry["id"], "repo_id": entry["repo_id"], "status": status, "local_revision": local,
+            "remote_revision": info.sha,
+            "remote_modified": info.last_modified.isoformat() if info.last_modified else None}
+
+
+# -------------------------------------------------------------- downloads
+_WORKER = (
+    "import json, sys\n"
+    "from huggingface_hub import snapshot_download\n"
+    "repo, local, pats = sys.argv[1], sys.argv[2] or None, json.loads(sys.argv[3])\n"
+    "print(snapshot_download(repo, local_dir=local, allow_patterns=pats))\n"
+)
+
+
+def _hub_cache_dir(repo_id: str) -> Path:
+    from huggingface_hub import constants
+
+    return Path(constants.HF_HUB_CACHE) / ("models--" + repo_id.replace("/", "--"))
+
+
 class Downloader:
+    """Downloads run in a subprocess so they can be cancelled; partial files resume next time."""
+
     def __init__(self, models_dir: Path):
         self.models_dir = models_dir
         self.jobs: Dict[str, dict] = {}
+        self._procs: Dict[str, subprocess.Popen] = {}
         self._lock = threading.Lock()
 
-    def start(self, repo_id: str, on_done=None) -> dict:
+    def start(self, repo_id: str, on_done=None, local_dir: Optional[str] = "auto", upgrade: bool = False) -> dict:
         with self._lock:
             job = self.jobs.get(repo_id)
             if job and job["state"] == "downloading":
                 return job
-            local = self.models_dir / repo_id.split("/")[-1]
-            job = {"repo_id": repo_id, "path": str(local), "state": "downloading", "error": None,
-                   "downloaded_gb": 0.0, "total_gb": None, "started": time.time()}
+            if local_dir == "auto":
+                local_dir = str(self.models_dir / repo_id.split("/")[-1])
+            job = {"repo_id": repo_id, "path": local_dir, "state": "downloading", "error": None,
+                   "kind": "upgrade" if upgrade else "download",
+                   "downloaded_gb": 0.0, "total_gb": None, "started": time.time(), "finished": None}
             self.jobs[repo_id] = job
         threading.Thread(target=self._run, args=(job, on_done), daemon=True).start()
         return job
 
-    def _run(self, job: dict, on_done) -> None:
-        from huggingface_hub import HfApi, snapshot_download
+    def cancel(self, repo_id: str) -> dict:
+        with self._lock:
+            job = self.jobs.get(repo_id)
+            proc = self._procs.get(repo_id)
+            if not job or job["state"] != "downloading":
+                raise KeyError(repo_id)
+            job["state"] = "cancelled"
+        if proc:
+            proc.terminate()
+        return job
 
-        local = Path(job["path"])
+    def discard(self, repo_id: str) -> dict:
+        """Forget a cancelled/failed job and delete its partial files from the models dir."""
+        with self._lock:
+            job = self.jobs.get(repo_id)
+            if not job or job["state"] == "downloading":
+                raise KeyError(repo_id)
+            del self.jobs[repo_id]
+        freed = 0
+        if job["state"] != "done" and job["path"]:
+            path = Path(job["path"]).resolve()
+            if self.models_dir.resolve() in path.parents and path.exists():
+                freed = _dir_bytes(path)
+                shutil.rmtree(path)
+        return {"repo_id": repo_id, "discarded": True, "freed_gb": round(freed / GB, 2)}
+
+    def _run(self, job: dict, on_done) -> None:
+        repo = job["repo_id"]
+        local = Path(job["path"]) if job["path"] else None
+        watch = local or _hub_cache_dir(repo)
+        start_bytes = _dir_bytes(watch) if watch.exists() and local is None else 0
+        remote_files = None
         try:
-            info = HfApi().model_info(job["repo_id"], files_metadata=True)
-            job["total_gb"] = round(sum((s.size or 0) for s in info.siblings) / GB, 2)
-        except Exception:
-            pass
+            info = _api().model_info(repo, files_metadata=True)
+            files = [s for s in info.siblings if _wanted(s.rfilename)]
+            remote_files = {s.rfilename for s in files}
+            job["total_gb"] = round(sum((s.size or 0) for s in files) / GB, 2)
+            job["revision"] = info.sha
+        except Exception as e:
+            log.warning("Could not read %s metadata: %s", repo, e)
         stop = threading.Event()
 
         def progress():
             while not stop.wait(1.0):
-                if local.exists():
-                    job["downloaded_gb"] = round(_dir_bytes(local) / GB, 2)
+                if watch.exists():
+                    job["downloaded_gb"] = round(max(0, _dir_bytes(watch) - start_bytes) / GB, 2)
 
         threading.Thread(target=progress, daemon=True).start()
         try:
-            local.mkdir(parents=True, exist_ok=True)
-            snapshot_download(job["repo_id"], local_dir=str(local), allow_patterns=ALLOW_PATTERNS)
-            job["downloaded_gb"] = round(_dir_bytes(local) / GB, 2)
+            if local:
+                local.mkdir(parents=True, exist_ok=True)
+                if not (local / META_FILE).exists():
+                    _write_meta(local, {"repo_id": repo})
+            proc = subprocess.Popen(
+                [sys.executable, "-c", _WORKER, repo, str(local) if local else "", json.dumps(ALLOW_PATTERNS)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            with self._lock:
+                self._procs[repo] = proc
+            out, err = proc.communicate()
+            if job["state"] == "cancelled":
+                return
+            if proc.returncode != 0:
+                lines = [ln for ln in err.strip().splitlines() if ln.strip()]
+                raise RuntimeError(lines[-1] if lines else f"download exited with {proc.returncode}")
+            snapshot = Path(out.strip().splitlines()[-1])
+            if local:
+                if remote_files is not None:
+                    _remove_stale(local, remote_files)
+                _write_meta(local, {"repo_id": repo, "revision": job.get("revision"),
+                                    "downloaded_at": time.time()})
+            else:
+                job["path"] = str(snapshot)
+                _prune_old_revisions(repo, snapshot)
+            job["downloaded_gb"] = job["total_gb"] or round(_dir_bytes(snapshot) / GB, 2)
             job["state"] = "done"
             if on_done:
                 on_done(job)
@@ -124,10 +383,66 @@ class Downloader:
             job["state"] = "error"
             job["error"] = str(e)
         finally:
+            job["finished"] = time.time()
             stop.set()
+            with self._lock:
+                self._procs.pop(repo, None)
 
     def status(self) -> List[dict]:
         return list(self.jobs.values())
+
+
+def _remove_stale(local: Path, remote_files: set) -> None:
+    """After an upgrade, drop files the new revision no longer has (e.g. re-sharded weights)."""
+    for f in local.rglob("*"):
+        rel = f.relative_to(local).as_posix()
+        if f.is_file() and not rel.startswith(".cache/") and rel != META_FILE and _wanted(rel) \
+                and rel not in remote_files:
+            f.unlink()
+
+
+def _prune_old_revisions(repo_id: str, keep: Path) -> None:
+    from huggingface_hub import scan_cache_dir
+
+    cache = scan_cache_dir()
+    for repo in cache.repos:
+        if repo.repo_id == repo_id and repo.repo_type == "model":
+            old = [r.commit_hash for r in repo.revisions if Path(r.snapshot_path) != keep]
+            if old:
+                cache.delete_revisions(*old).execute()
+
+
+# --------------------------------------------------------------- benchmarks
+class BenchmarkStore:
+    def __init__(self, models_dir: Path):
+        self.path = models_dir / BENCH_FILE
+        self._lock = threading.Lock()
+
+    def _read(self) -> Dict[str, List[dict]]:
+        try:
+            return json.loads(self.path.read_text())
+        except Exception:
+            return {}
+
+    def add(self, model_id: str, result: dict) -> None:
+        with self._lock:
+            data = self._read()
+            data.setdefault(model_id, []).append(result)
+            data[model_id] = data[model_id][-20:]
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(data, indent=1))
+
+    def get(self, model_id: str) -> List[dict]:
+        return self._read().get(model_id, [])
+
+    def all(self) -> Dict[str, List[dict]]:
+        return self._read()
+
+    def forget(self, model_id: str) -> None:
+        with self._lock:
+            data = self._read()
+            if data.pop(model_id, None) is not None:
+                self.path.write_text(json.dumps(data, indent=1))
 
 
 def recommendations(budget_bytes: int, total_ram: int) -> List[dict]:
