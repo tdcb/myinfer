@@ -165,6 +165,7 @@ const fmt = n => n == null ? '—' : Number(n).toLocaleString();
 const gb = n => n == null ? '—' : `${Number(n).toFixed(1)} GB`;
 let history = [];
 let busy = false;
+let localError = '';
 
 function kv(el, pairs) {
   el.innerHTML = pairs.filter(p => p[1] !== undefined).map(([k, v]) => `<span>${k}</span><span>${v ?? '—'}</span>`).join('');
@@ -175,7 +176,7 @@ async function refresh() {
   try { s = await (await fetch('/v1/engine/stats')).json(); } catch { return; }
   const st = $('state'); st.textContent = s.state; st.className = 'badge ' + s.state;
   $('btn-load').disabled = s.state === 'loading';
-  $('load-error').textContent = s.state === 'error' ? s.error : '';
+  $('load-error').textContent = localError || (s.state === 'error' ? s.error : '');
   const h = s.hardware;
   kv($('hw'), [['chip', h.chip], ['gpu', h.metal ? h.gpu : 'CPU (no Metal)'], ['unified memory', gb(h.total_ram_gb)],
     ['GPU budget', gb(h.gpu_limit_gb)], ['active / peak', `${gb(s.memory.active_gb)} / ${gb(s.memory.peak_gb)}`], ['MLX', h.mlx_version]]);
@@ -239,17 +240,18 @@ async function download(repo) {
 
 $('btn-load').onclick = async () => {
   const body = { model: $('model').value.trim() };
-  if (!body.model) { $('load-error').textContent = 'Enter a model'; return; }
+  if (!body.model) { localError = 'Enter a model'; $('load-error').textContent = localError; return; }
+  localError = '';
   body.kv_bits = Number($('kv_bits').value);
   body.rope_scaling = $('rope_scaling').value;
   body.stream_experts = $('stream_experts').value;
   for (const k of ['max_context', 'memory_budget_gb', 'expert_cache_gb']) if ($(k).value) body[k] = Number($(k).value);
   if ($('draft_model').value.trim()) body.draft_model = $('draft_model').value.trim();
   const r = await fetch('/v1/models/load', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!r.ok) $('load-error').textContent = (await r.json()).error.message;
+  if (!r.ok) localError = (await r.json()).error.message;
   refresh();
 };
-$('btn-unload').onclick = async () => { await fetch('/v1/models/unload', { method: 'POST' }); refresh(); };
+$('btn-unload').onclick = async () => { localError = ''; await fetch('/v1/models/unload', { method: 'POST' }); refresh(); };
 $('btn-clear').onclick = () => { history = []; $('chat').innerHTML = ''; };
 
 function addMsg(role, text) {
