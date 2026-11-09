@@ -1,5 +1,5 @@
 # Compiled binaries & build artifacts
-m5engine
+native/m5engine
 *.o
 *.dSYM/
 *.metallib
@@ -13,3 +13,9 @@ __pycache__/
 # Large converted model binaries
 *.m5e
 models/**/.download_status.json
+
+# Local model weights
+/models/
+.pytest_cache/
+*.egg-info/
+.venv/

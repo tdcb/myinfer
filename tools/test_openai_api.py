@@ -1,148 +1,85 @@
 #!/usr/bin/env python3
-"""
-End-to-End OpenAI API & SSE Streaming Verification Suite for M5Engine
-Tests:
-  1. GET /v1/models (Dense & MoE model discovery)
-  2. POST /v1/chat/completions (Dense cold prefill vs. Radix Prefix KV-Cache hit TTFT)
-  3. POST /v1/chat/completions with stream=True (Server-Sent Events streaming)
-  4. POST /v1/chat/completions with MoE model (Dynamic adaptation to sparse Top-K routing + hot expert pinning)
-  5. GET /v1/engine/stats (Apple M5 Pro hardware & memory telemetry)
+"""End-to-end check of a running M5Engine server against a real loaded model.
+
+    python -m m5engine serve --model mlx-community/Qwen3-0.6B-4bit --port 8080 &
+    python tools/test_openai_api.py --port 8080
 """
 
+import argparse
 import json
-import subprocess
-import time
-import urllib.request
 import sys
+import time
+import urllib.error
+import urllib.request
 
 
-def http_get(url: str) -> dict:
-    with urllib.request.urlopen(url, timeout=10) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def get(base, path):
+    with urllib.request.urlopen(base + path, timeout=30) as r:
+        return json.loads(r.read())
 
 
-def http_post_json(url: str, payload: dict) -> dict:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def post(base, path, payload, timeout=600):
+    req = urllib.request.Request(base + path, json.dumps(payload).encode(),
+                                 {"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, r.read()
 
 
-def http_post_sse(url: str, payload: dict) -> list:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    chunks = []
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        for line in resp:
-            decoded = line.decode("utf-8").strip()
-            if decoded.startswith("data: "):
-                data_str = decoded[6:]
-                if data_str == "[DONE]":
-                    break
-                chunks.append(json.loads(data_str))
-    return chunks
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--max-tokens", type=int, default=8)
+    a = ap.parse_args()
+    base = f"http://127.0.0.1:{a.port}"
+    results = []
 
+    def check(name, ok, detail=""):
+        results.append(ok)
+        print(f"{'PASS' if ok else 'FAIL'}  {name}  {detail}")
 
-def main():
-    port = 18092
-    base_url = f"http://127.0.0.1:{port}"
-    proc = subprocess.Popen(
-        ["./m5engine", "serve", "--port", str(port), "--model", "dense"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    for _ in range(600):
+        stats = get(base, "/v1/engine/stats")
+        if stats["state"] in ("ready", "error", "empty"):
+            break
+        time.sleep(1)
+    check("model ready", stats["state"] == "ready", stats.get("error") or "")
+    if stats["state"] != "ready":
+        return 1
+    ctx = stats["context"]
+    check("context plan", ctx["max_context"] >= 512,
+          f"max_context={ctx['max_context']} limited_by={ctx['limited_by']} yarn={ctx['yarn_factor']}")
+
+    models = get(base, "/v1/models")
+    check("/v1/models", len(models["data"]) == 1, models["data"][0]["id"])
+
+    msgs = [{"role": "user", "content": "What is the capital of France? Answer in one word."}]
+    common = {"max_tokens": a.max_tokens, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}
+    status, body = post(base, "/v1/chat/completions", {"messages": msgs, **common})
+    r = json.loads(body)
+    text = r["choices"][0]["message"]["content"]
+    check("chat completion", status == 200 and "paris" in text.lower(), repr(text))
+    u = r["usage"]
+    print(f"      ttft {u['m5engine']['ttft_ms']} ms, decode {u['m5engine']['decode_tps']} tok/s")
+
+    msgs2 = msgs + [{"role": "assistant", "content": text}, {"role": "user", "content": "And of Germany?"}]
+    status, body = post(base, "/v1/chat/completions", {"messages": msgs2, "stream": True, **common})
+    events = [json.loads(l[6:]) for l in body.decode().splitlines() if l.startswith("data: {")]
+    streamed = "".join(e["choices"][0]["delta"].get("content", "") for e in events if e.get("choices"))
+    usage = next((e["usage"] for e in events if e.get("usage")), {})
+    check("streaming", "berlin" in streamed.lower(), repr(streamed))
+    check("prefix cache reuse", usage.get("prompt_tokens_details", {}).get("cached_tokens", 0) > 0,
+          f"cached {usage.get('prompt_tokens_details')}")
+
     try:
-        # Wait for server startup
-        for _ in range(30):
-            try:
-                stats = http_get(f"{base_url}/health")
-                if stats.get("status") == "ok":
-                    break
-            except Exception:
-                time.sleep(0.1)
+        post(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "x " * (ctx["max_context"] + 10)}],
+                                            "max_tokens": 1})
+        check("context overflow rejected", False)
+    except urllib.error.HTTPError as e:
+        check("context overflow rejected", e.code == 400)
 
-        print("=== 1. Testing GET /v1/models ===")
-        models = http_get(f"{base_url}/v1/models")
-        print(f"Models available: {[m['id'] for m in models['data']]}")
-        assert len(models["data"]) >= 2
-
-        system_prompt = (
-            "You are an Apple Silicon M5 Pro optimization assistant. "
-            "Always leverage 128-byte cache-line coalesced Q4_G64 kernels, "
-            "Radix Prefix KV-Cache reuse, Dense Speculative MTP, and MoE Fused Sparse Routing."
-        ) * 4
-
-        print("\n=== 2. Testing Dense Chat Completion (Cold vs. Warm Radix Prefix KV Hit) ===")
-        res_cold = http_post_json(
-            f"{base_url}/v1/chat/completions",
-            {
-                "model": "qwen3.8-27b-m5-q4",
-                "max_tokens": 24,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "Explain unified memory zero-copy."},
-                ],
-            },
-        )
-        t_cold = res_cold["m5_hardware_telemetry"]
-        print(f"Cold Turn -> TTFT: {t_cold['ttft_ms']} ms | Cached: {t_cold['prefix_cached_tokens']} toks | Decode: {t_cold['decode_tokens_per_sec']} tok/s | Mean Tok/Pass: {t_cold['mean_tokens_per_pass']}x")
-
-        res_warm = http_post_json(
-            f"{base_url}/v1/chat/completions",
-            {
-                "model": "qwen3.8-27b-m5-q4",
-                "max_tokens": 24,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "Now explain why fans stay quiet."},
-                ],
-            },
-        )
-        t_warm = res_warm["m5_hardware_telemetry"]
-        print(f"Warm Turn -> TTFT: {t_warm['ttft_ms']} ms | Cached: {t_warm['prefix_cached_tokens']} toks | Decode: {t_warm['decode_tokens_per_sec']} tok/s | Mean Tok/Pass: {t_warm['mean_tokens_per_pass']}x")
-        assert t_warm["prefix_cached_tokens"] > 0
-
-        print("\n=== 3. Testing SSE Streaming (/v1/chat/completions stream=True) ===")
-        chunks = http_post_sse(
-            f"{base_url}/v1/chat/completions",
-            {
-                "model": "qwen3.8-27b-m5-q4",
-                "max_tokens": 16,
-                "stream": True,
-                "messages": [{"role": "user", "content": "Stream response tokens."}],
-            },
-        )
-        streamed_text = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
-        print(f"Received {len(chunks)} SSE chunks: {streamed_text[:80]}...")
-        assert len(chunks) > 0
-
-        print("\n=== 4. Testing Dynamic Adaptation to Mixture-of-Experts (MoE) ===")
-        res_moe = http_post_json(
-            f"{base_url}/v1/chat/completions",
-            {
-                "model": "qwen3.8-moe-16x4-m5-q4",
-                "max_tokens": 24,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "Route across sparse MoE experts on M5 Pro."},
-                ],
-            },
-        )
-        t_moe = res_moe["m5_hardware_telemetry"]
-        print(f"MoE Turn  -> Arch: {t_moe['architecture']} | Active Experts/Tok: {t_moe['active_experts_per_tok']} | Pinned Hot Experts: {t_moe['pinned_hot_experts']} | Decode: {t_moe['decode_tokens_per_sec']} tok/s")
-        assert "Mixture-of-Experts" in t_moe["architecture"]
-        assert t_moe["active_experts_per_tok"] == 4
-
-        print("\n=== 5. Testing GET /v1/engine/stats ===")
-        stats = http_get(f"{base_url}/v1/engine/stats")
-        print(json.dumps(stats["hardware"], indent=2))
-        print("\nALL PYTHON OPENAI CLIENT TESTS PASSED!")
-
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
+    print(f"\n{sum(results)}/{len(results)} checks passed")
+    return 0 if all(results) else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
