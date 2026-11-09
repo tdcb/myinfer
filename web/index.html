@@ -238,6 +238,8 @@
 const $ = id => document.getElementById(id);
 const fmt = n => n == null ? '—' : Number(n).toLocaleString();
 const gb = n => n == null ? '—' : `${Number(n).toFixed(1)} GB`;
+const freed = n => n > 0 && n < 0.1 ? `${Math.max(1, Math.round(n * 1024))} MB` : gb(n);
+const tps = n => n == null ? '—' : n < 10 ? Number(n).toFixed(1) : fmt(Math.round(n));
 let history = [];
 let busy = false;
 let localError = '';
@@ -335,7 +337,7 @@ function renderInstalled() {
       <td>${typeLabel(m)}</td>
       <td class="num">${gb(m.disk_gb ?? m.size_gb)}</td>
       <td class="num">${b ? b.decode_tps.toFixed(1) : '—'}</td>
-      <td class="num">${b ? fmt(Math.round(b.prompt_tps)) : '—'}</td>
+      <td class="num">${b ? tps(b.prompt_tps) : '—'}</td>
       <td class="num">${b ? fmt(Math.round(b.ttft_ms)) + ' ms' : '—'}</td>
       <td class="num">${b ? b.peak_memory_gb : '—'}</td>
       <td><div class="actions">
@@ -357,7 +359,7 @@ async function loadHistory(m, i) {
   const el = $('hist-' + i); if (!el) return;
   el.innerHTML = `<table class="mm"><thead><tr><th>When</th><th style="text-align:right">Prompt / out</th><th style="text-align:right">Decode tok/s</th><th style="text-align:right">Prefill tok/s</th><th style="text-align:right">TTFT</th><th style="text-align:right">Peak GB</th><th>Settings</th><th>Device</th></tr></thead><tbody>` +
     d.data.slice().reverse().map(r => `<tr><td>${ago(r.time)}</td><td class="num">${fmt(r.prompt_tokens)} / ${fmt(r.completion_tokens)}</td>
-      <td class="num">${r.decode_tps.toFixed(1)}</td><td class="num">${fmt(Math.round(r.prompt_tps))}</td><td class="num">${fmt(Math.round(r.ttft_ms))} ms</td>
+      <td class="num">${r.decode_tps.toFixed(1)}</td><td class="num">${tps(r.prompt_tps)}</td><td class="num">${fmt(Math.round(r.ttft_ms))} ms</td>
       <td class="num">${r.peak_memory_gb}</td>
       <td>${r.kv_bits ? r.kv_bits + '-bit KV' : 'fp16 KV'}${r.draft_model ? ` · draft ${esc(r.draft_model.split('/').pop())} (${fmt(r.draft_accepted)} accepted)` : ''}${r.expert_streaming ? ` · SSD experts, ${(r.expert_hit_rate * 100).toFixed(0)}% hit` : ''}</td>
       <td>${esc(r.chip)} · ${r.device}</td></tr>`).join('') + '</tbody></table>';
@@ -382,7 +384,7 @@ $('installed').onclick = async e => {
     if (!confirm(`Delete ${m.name} (${gb(m.disk_gb ?? m.size_gb)}) from disk? Its benchmark history is removed too.`)) return;
     const r = await post('/v1/models/delete', { id: m.id });
     if (!r.ok) return notice(await apiError(r), true);
-    const d = await r.json(); notice(`Deleted ${m.name}, freed ${gb(d.freed_gb)}`); refreshModels();
+    const d = await r.json(); notice(`Deleted ${m.name}, freed ${freed(d.freed_gb)}`); refreshModels();
   }
 };
 
@@ -416,7 +418,7 @@ async function pollBenchmark() {
     el.textContent = `${benchJob.state === 'loading' ? 'Loading' : 'Benchmarking'} ${name} (${fmt(benchJob.prompt_tokens)}-token prompt, ${benchJob.gen_tokens} tokens out)… ${Math.round(Date.now() / 1000 - benchJob.started)} s`;
     renderInstalled(); setTimeout(pollBenchmark, 1500); return;
   }
-  if (benchJob.state === 'done') { const b = benchJob.result; el.textContent = `Last benchmark: ${name} — ${b.decode_tps.toFixed(1)} tok/s decode, ${Math.round(b.prompt_tps)} tok/s prefill, ${Math.round(b.ttft_ms)} ms TTFT, ${b.peak_memory_gb} GB peak (${b.device})`; }
+  if (benchJob.state === 'done') { const b = benchJob.result; el.textContent = `Last benchmark: ${name} — ${b.decode_tps.toFixed(1)} tok/s decode, ${tps(b.prompt_tps)} tok/s prefill, ${Math.round(b.ttft_ms)} ms TTFT, ${b.peak_memory_gb} GB peak (${b.device})`; }
   else if (benchJob.state === 'error') { el.innerHTML = `<span class="err">Benchmark of ${esc(name)} failed: ${esc(benchJob.error)}</span>`; }
   refreshModels();
 }
@@ -445,7 +447,7 @@ $('downloads').onclick = async e => {
   if (x) {
     const resp = await post('/v1/models/download/discard', { repo_id: x.dataset.discard });
     if (!resp.ok) return notice(await apiError(resp), true);
-    notice(`Discarded partial download, freed ${gb((await resp.json()).freed_gb)}`); refreshDownloads(); refreshModels();
+    notice(`Discarded partial download, freed ${freed((await resp.json()).freed_gb)}`); refreshDownloads(); refreshModels();
   }
   if (r) download(r.dataset.retry);
 };

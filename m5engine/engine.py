@@ -470,9 +470,17 @@ class Engine:
         bos = getattr(self.tokenizer, "bos_token_id", None)
         if bos is not None and unit and unit[0] == bos:
             unit = unit[1:]
-        filler = (unit * (prompt_tokens // len(unit) + 1))[:prompt_tokens]
-        messages = [{"role": "user", "content": self.tokenizer.decode(filler) + BENCH_QUESTION}]
-        tokens = self.encode_chat(messages, {"enable_thinking": False})
+        def build(n: int) -> List[int]:
+            filler = (unit * (n // len(unit) + 1))[:n]
+            messages = [{"role": "user", "content": self.tokenizer.decode(filler) + BENCH_QUESTION}]
+            return self.encode_chat(messages, {"enable_thinking": False})
+
+        n = max(1, prompt_tokens - len(build(0)))  # minus chat template + question
+        for _ in range(4):  # re-tokenization at the joins shifts the count slightly
+            tokens = build(n)
+            if len(tokens) == prompt_tokens:
+                break
+            n = max(1, n + prompt_tokens - len(tokens))
         params = GenerationParams(max_tokens=gen_tokens, temperature=0.0, use_prefix_cache=False,
                                   use_draft=use_draft)
         st = self.streaming.cache.stats if self.streaming else None
