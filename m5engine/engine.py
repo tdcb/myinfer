@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import threading
 import time
@@ -33,6 +34,7 @@ from .context import (
     yarn_capable,
     yarn_factor_for,
 )
+from . import deepseek_v41 as dsv41
 from .expert_stream import (
     repack_experts,
     set_active_experts,
@@ -75,6 +77,10 @@ class LoadOptions:
     warm_experts: bool = True  # pre-read the profile's hottest experts at load
     elastic_expert_cache: bool = True  # lend unused KV budget to the expert cache
     active_experts: Optional[int] = None  # route to fewer experts than the model's default
+    # DeepSeek V4.1 (oMLX backend): share of each layer's experts kept in memory (default: largest that fits)
+    expert_resident_fraction: Optional[float] = None
+    engram_ssd: bool = True  # serve the Engram n-gram tables from the SSD
+    ced_prefill: bool = True  # oMLX's Causal Encoder-Decoder prefill path
     draft_model: Optional[str] = None
     num_draft_tokens: int = 3
     prefill_step: int = 2048
@@ -160,6 +166,7 @@ class Engine:
         self.streaming: Optional[StreamingInfo] = None
         self.default_active_experts: Optional[int] = None
         self._requests_since_save = 0
+        self.dsv41: Optional[dsv41.Loaded] = None  # set when the oMLX DeepSeek V4.1 backend serves the model
         self.prefix = PrefixCache()
         self.resident_bytes = 0
         self.load_seconds = 0.0
@@ -193,6 +200,7 @@ class Engine:
             self.streaming.cache.close()
         self.model = self.draft_model = self.tokenizer = None
         self.streaming = None
+        self.dsv41 = None
         self.plan = None
         self.footprint = None
         self.prefix.clear()
@@ -222,6 +230,9 @@ class Engine:
         if opts.kv_bits not in (0, 4, 8):
             raise EngineError("kv_bits must be 0 (fp16), 4 or 8")
         path = _download(opts.model)
+        config = json.loads((Path(path) / "config.json").read_text())
+        if dsv41.is_deepseek_v41(config):
+            return self._load_deepseek_v41(opts, Path(path), config, t0)
         model, config = load_model(path, lazy=True)
         tokenizer = load_tokenizer(
             path,
@@ -341,6 +352,62 @@ class Engine:
             opts.model, self.load_seconds, resident_bytes / GB, plan.max_context, plan.limited_by,
         )
 
+    def _load_deepseek_v41(self, opts: LoadOptions, path: Path, config: dict, t0: float) -> None:
+        """Serve DeepSeek V4.1 through oMLX: Engram on SSD, bounded expert residency sized by our budget."""
+        try:
+            dsv41.require()
+        except RuntimeError as e:
+            raise EngineError(str(e)) from None
+        if opts.draft_model:
+            raise EngineError("DeepSeek V4.1 does not take a separate draft model.")
+        budget = self.budget_bytes(opts)
+        native, plain_limit = native_context(config)
+        hidden = int(config.get("text_config", config).get("hidden_size") or 5120)
+        reserve = reserve_bytes(budget, hidden, opts.prefill_step)
+        # DeepSeek's compressed KV is small (~1 KB/token); hold back the KV for the
+        # first 32K tokens before fitting experts, and plan the rest after measuring.
+        kv_hold = int(1024 * min(plain_limit, opts.max_context or 32768, 32768))
+        try:
+            plan_r = dsv41.plan_residency(path, budget - reserve - kv_hold, engram_ssd=opts.engram_ssd,
+                                          fraction=opts.expert_resident_fraction)
+            loaded = dsv41.load(path, plan_r, ced_prefill=opts.ced_prefill)
+        except RuntimeError as e:
+            raise EngineError(str(e)) from None
+        model, tokenizer = loaded.model, loaded.tokenizer
+        resident_bytes = max(_param_bytes(model), plan_r.admission_bytes)
+        if mx.metal.is_available():
+            try:
+                mx.set_wired_limit(min(budget, self.hw.recommended_working_set_bytes))
+            except Exception as e:  # pragma: no cover - macOS only
+                log.warning("Could not set wired limit: %s", e)
+        per_tok, fixed = dsv41.measure_cache_bytes(model)
+        fp = KVFootprint(per_tok, fixed, 0)
+        plan = plan_context(
+            config=config, footprint=fp, budget_bytes=budget, resident_weight_bytes=resident_bytes,
+            expert_cache_bytes=0, prefill_step=opts.prefill_step, rope_scaling="off",
+            requested_context=opts.max_context,
+        )
+        if plan.max_context < 512:
+            raise EngineError(
+                f"Only {plan.max_context} tokens of cache fit next to the resident experts; "
+                "lower expert_resident_fraction or pick a smaller checkpoint."
+            )
+        self.model, self.draft_model, self.tokenizer = model, None, tokenizer
+        self.config, self.options, self.model_path = config, opts, path
+        self.plan, self.footprint, self.streaming = plan, fp, None
+        self.dsv41 = loaded
+        self.resident_bytes = resident_bytes
+        self.prefix = PrefixCache(max_entries=0)  # oMLX's cache objects are not prefix-reusable here
+        self._native, self._plain_limit = native, plain_limit
+        self._yarn_now = 1.0
+        self.default_active_experts = None
+        self.load_seconds = time.perf_counter() - t0
+        self.last = RequestMetrics()
+        self._requests_since_save = 0
+        log.info("Loaded %s via oMLX in %.1fs: %d/%d experts per layer resident, max context %d (%s)",
+                 opts.model, self.load_seconds, plan_r.resident_experts, plan_r.experts_per_layer,
+                 plan.max_context, plan.limited_by)
+
     def _set_yarn(self, factor: float) -> None:
         if factor == self._yarn_now:
             return
@@ -369,6 +436,11 @@ class Engine:
             if isinstance(content, list):
                 content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
             msgs.append({**m, "content": content or ""})
+        if self.dsv41 is not None:
+            kwargs = dict(chat_template_kwargs or {})
+            if tools:
+                kwargs["tools"] = tools
+            return dsv41.encode_chat(self.dsv41, msgs, kwargs)
         if getattr(tok, "chat_template", None):
             kwargs = dict(chat_template_kwargs or {})
             if tools:
@@ -405,7 +477,7 @@ class Engine:
             use_prefix = opts.prefix_cache and params.use_prefix_cache
             cache, hit = (self.prefix.take(key, tokens) if use_prefix else (None, 0))
             if cache is None:
-                cache = make_prompt_cache(self.model)
+                cache = self.model.make_cache() if self.dsv41 is not None else make_prompt_cache(self.model)
                 if self.draft_model is not None:
                     cache += make_prompt_cache(self.draft_model)
                 hit = 0
@@ -434,10 +506,11 @@ class Engine:
                 logits_processors=processors,
                 prompt_cache=cache,
                 prefill_step_size=opts.prefill_step,
-                kv_bits=opts.kv_bits or None,
-                kv_group_size=opts.kv_group_size,
-                quantized_kv_start=opts.quantized_kv_start,
             )
+            if self.dsv41 is None:  # oMLX's cache keeps its own (compressed) KV format
+                kwargs.update(kv_bits=opts.kv_bits or None, kv_group_size=opts.kv_group_size,
+                              quantized_kv_start=opts.quantized_kv_start)
+            ds_before = dsv41.expert_stats(self.model) if self.dsv41 is not None else None
             if draft is not None:
                 kwargs["num_draft_tokens"] = opts.num_draft_tokens
 
@@ -453,10 +526,13 @@ class Engine:
             hold = max((len(s) for s in stop), default=1) - 1
             stopped = False
             try:
-                for resp in stream_generate(
+                steps = stream_generate(
                     self.model, self.tokenizer, mx.array(tokens[hit:]), max_tokens,
                     draft_model=draft, **kwargs,
-                ):
+                )
+                if self.dsv41 is not None:
+                    steps = dsv41.generate_with_prefill_scope(self.model, steps)
+                for resp in steps:
                     if t_first is None:
                         t_first = time.perf_counter()
                         m.ttft_ms = (t_first - t0) * 1000
@@ -488,6 +564,11 @@ class Engine:
                 m.completion_tokens = len(generated)
                 m.finish_reason = finish
                 m.peak_memory_gb = round(mx.get_peak_memory() / GB, 2)
+                if ds_before is not None:
+                    ds_after = dsv41.expert_stats(self.model) or ds_before
+                    hits = ds_after["hits"] - ds_before["hits"]
+                    misses = ds_after["misses"] - ds_before["misses"]
+                    m.expert_hit_rate = round(hits / (hits + misses), 4) if hits + misses else None
                 if st is not None:
                     hits, misses = st.hits - io0[0], st.misses - io0[1]
                     m.expert_hit_rate = round(hits / (hits + misses), 4) if hits + misses else None
@@ -577,6 +658,9 @@ class Engine:
         for chunk in self.generate(tokens, params):
             m = chunk.metrics or m
         st = self.streaming.to_dict() if self.streaming else None
+        if self.dsv41 is not None:
+            ds = dsv41.expert_stats(self.model) or {}
+            st = {"cache_capacity_gb": None, "cached_experts": ds.get("resident_experts"), "packed": None}
         return {
             "time": time.time(),
             "model": self.options.model,
@@ -624,7 +708,8 @@ class Engine:
             "id": opts.model,
             "path": str(self.model_path),
             "type": self.config.get("model_type"),
-            "moe": bool(self.streaming) or bool(find_expert_modules(self.model)),
+            "moe": bool(self.streaming) or bool(self.dsv41) or bool(find_expert_modules(self.model)),
+            "backend": "omlx" if self.dsv41 is not None else "mlx-lm",
             "resident_gb": round(self.resident_bytes / GB, 2),
             "load_seconds": round(self.load_seconds, 1),
             "draft_model": opts.draft_model,
@@ -635,6 +720,8 @@ class Engine:
         d["options"] = asdict(opts)
         d["context"] = {**self.plan.to_dict(), "current_yarn_factor": self._yarn_now}
         d["expert_streaming"] = self.streaming.to_dict() if self.streaming else None
+        if self.dsv41 is not None:
+            d["expert_streaming"] = {**self.dsv41.plan.to_dict(), **(dsv41.expert_stats(self.model) or {})}
         d["prefix_cache"] = {
             "entries": len(self.prefix),
             "gb": round(self.prefix.nbytes / GB, 2),

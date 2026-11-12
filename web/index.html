@@ -126,6 +126,7 @@
       </label>
       <label>Expert cache GB (blank = auto)<input id="expert_cache_gb" type="number" step="1" /></label>
       <label title="Route each token to fewer experts than the model's default: less read from the SSD per token, slightly lower quality">Active experts (blank = model default)<input id="active_experts" type="number" min="1" step="1" /></label>
+      <label title="DeepSeek V4.1 only (oMLX backend): share of each layer's experts kept in memory; blank = the largest that fits">Resident experts 0–1 (DeepSeek V4.1)<input id="expert_resident_fraction" type="number" min="0.01" max="1" step="0.01" /></label>
     </div>
     <label>Draft model for speculative decoding (optional)<input id="draft_model" list="local-models" placeholder="mlx-community/Qwen3-0.6B-4bit" /></label>
     </div></details>
@@ -283,7 +284,12 @@ async function refresh() {
   const es = s.expert_streaming;
   $('stream-card').style.display = es ? '' : 'none';
   const m = s.last_request;
-  if (es) kv($('stream'), [['experts on disk', `${gb(es.total_expert_gb)}${es.packed ? ' (packed)' : ''}`],
+  if (es && es.backend === 'omlx') kv($('stream'), [['backend', 'oMLX DeepSeek V4.1'],
+    ['experts in memory', `${fmt(es.resident_experts_per_layer)} of ${fmt(es.experts_per_layer)} per layer (${(es.resident_fraction * 100).toFixed(0)}%)`],
+    ['memory at load', `${gb(es.admission_gb)} (full model ${gb(es.full_model_gb)})`],
+    ['Engram tables', `${gb(es.engram_gb)} ${es.engram_on_ssd ? 'on SSD' : 'in memory'}`],
+    ['hit rate', `${((es.hit_rate || 0) * 100).toFixed(1)}%${m && m.expert_hit_rate != null ? ` · last request ${(m.expert_hit_rate * 100).toFixed(0)}%` : ''}`]]);
+  else if (es) kv($('stream'), [['experts on disk', `${gb(es.total_expert_gb)}${es.packed ? ' (packed)' : ''}`],
     ['cache', `${gb(es.cache_used_gb)} / ${gb(es.cache_capacity_gb)}${es.cache_capacity_gb > es.cache_base_gb ? ` (base ${gb(es.cache_base_gb)})` : ''}`],
     ['experts in memory', `${fmt(es.cached_experts)} of ${fmt(es.moe_layers * es.num_experts)} (${(es.resident_fraction * 100).toFixed(0)}%) × ${es.expert_mb} MB`],
     ['hit rate', `${(es.hit_rate * 100).toFixed(1)}%${m && m.ssd_mb_per_token != null ? ` · last request ${m.ssd_mb_per_token} MB/token from SSD` : ''}`],
@@ -541,7 +547,7 @@ $('btn-load').onclick = async () => {
   body.kv_bits = Number($('kv_bits').value);
   body.rope_scaling = $('rope_scaling').value;
   body.stream_experts = $('stream_experts').value;
-  for (const k of ['max_context', 'memory_budget_gb', 'expert_cache_gb', 'active_experts']) if ($(k).value) body[k] = Number($(k).value);
+  for (const k of ['max_context', 'memory_budget_gb', 'expert_cache_gb', 'active_experts', 'expert_resident_fraction']) if ($(k).value) body[k] = Number($(k).value);
   if ($('draft_model').value.trim()) body.draft_model = $('draft_model').value.trim();
   const r = await fetch('/v1/models/load', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!r.ok) localError = (await r.json()).error.message;

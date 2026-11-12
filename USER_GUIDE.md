@@ -117,6 +117,47 @@ shows what the warm cache is worth. `python -m m5engine plan --estimate
 --model REPO` prints the disk, memory and context estimate for a Hub repo
 without downloading it.
 
+### DeepSeek-V4.1-Flash (oMLX backend)
+
+DeepSeek-V4.1-Flash (552B, 40 layers, 384 experts per layer, 6 active, plus
+196B of Engram n-gram tables) cannot be loaded by mlx-lm: its `deepseek_v41`
+refuses the Engram layers. M5Engine serves it through
+[oMLX](https://github.com/jundot/omlx) (Apache-2.0), installed as an optional
+backend into the same environment:
+
+```sh
+tools/install_deepseek_backend.sh      # Python 3.11+, macOS; pins the oMLX commit in m5engine/deepseek_v41.py
+python -m m5engine plan --estimate --model mlx-community/DeepSeek-V4.1-Flash-MLX-2bit
+python -m m5engine bench --model <downloaded dir> --preset strata
+```
+
+What happens at load (`model_type == deepseek_v41` is detected automatically):
+
+- oMLX's loader reads the checkpoint with **Engram tables on the SSD**
+  (`engram_ssd=true`) and **bounded expert residency**: M5Engine asks oMLX
+  for the largest share of experts per layer whose load estimate fits the
+  memory budget after the activation reserve and a 32K-token KV hold-back
+  (`expert_resident_fraction` pins it instead). Misses are positional reads
+  from the checkpoint's own safetensors; routing is unchanged, so output
+  quality does not depend on the fraction, only speed does.
+- DeepSeek's own chat encoder is used (the tokenizer ships no chat template);
+  `chat_template_kwargs` accepts `enable_thinking`, `thinking_mode` and
+  `reasoning_effort`.
+- The KV cache is oMLX's compressed format, measured after load for the
+  context plan; `kv_bits` and the prefix cache do not apply.
+- The Models tab's expert card shows experts in memory per layer, memory at
+  load vs the full model, Engram size/location and the hit rate; benchmarks
+  record the hit rate.
+
+Checkpoints and disk: `mlx-community/DeepSeek-V4.1-Flash-MLX-2bit` is 222 GiB,
+`mlx-community/DeepSeek-V4.1-Flash-1017-oQ2e-mtp` 292 GiB (oMLX's own
+quantization, better quality). Keep ~300 GB free on the internal SSD. On a
+64 GB Mac expect roughly 12 GB of attention/shared weights resident plus
+whatever experts fit; nobody has published a 64 GB measurement yet, so treat
+decode speed as unknown until you run the benchmark.
+
+Not available on Linux: oMLX's DeepSeek kernels are Metal (`mx.fast.metal_kernel`).
+
 ## 5. Managing models (Models tab)
 
 - **Get models**: search MLX text-generation models on Hugging Face, or show the

@@ -81,9 +81,9 @@ Decode speed is bounded by memory bandwidth for in-memory models. For streamed
 models it is bounded by SSD reads of cache-missing experts
 (`ssd_mb_per_token` in every request's metrics): a bigger `--expert-cache-gb`,
 a lower-bit checkpoint or `--active-experts` all cut it. DeepSeek-V4.1-Flash
-(552B, 384 experts/layer, 6 active; 222-292 GiB as MLX 2-bit) is the target
-for the streamed path and needs ~300 GB of SSD; it is not yet loadable because
-mlx-lm lacks its Engram layers (see Status).
+(552B, 384 experts/layer, 6 active; 222-292 GiB as MLX 2-bit) needs ~300 GB
+of SSD and the oMLX backend (`tools/install_deepseek_backend.sh`); see
+USER_GUIDE §4.
 
 ## Layout
 
@@ -93,6 +93,7 @@ m5engine/
   context.py        KV footprint measurement, context planner, YaRN
   attention.py      memory-bounded attention over quantized KV
   expert_stream.py  SSD expert streaming, hot-expert profile, elastic cache, experts sidecar
+  deepseek_v41.py   DeepSeek-V4.1-Flash via the optional oMLX backend (Engram on SSD, expert residency)
   prefix_cache.py   longest-prefix KV reuse
   hardware.py       RAM / GPU working set / thermal state
   server.py         OpenAI-compatible HTTP server and control API
@@ -122,6 +123,9 @@ python tools/test_openai_api.py --port 8080   # against a running server with a 
 - The expert tiering (profile, warm fill, elastic cache, sidecar, active
   experts) is verified on Linux/CPU with OLMoE; its effect on speed needs a
   Mac and an SSD-streamed model (`python -m m5engine bench --preset strata`).
-- DeepSeek-V4.1-Flash: mlx-lm 0.32's `deepseek_v41` refuses the checkpoint
-  because its Engram (n-gram memory) layers are not implemented there; the
-  model needs a dedicated implementation before it can be benchmarked.
+- DeepSeek-V4.1-Flash is served through the optional oMLX backend
+  (`tools/install_deepseek_backend.sh`, Python 3.11+, macOS). The integration
+  (residency planning, chat encoding, CED prefill scope, metrics) is tested
+  against a stub and oMLX's planner on a tiny checkpoint; no real DeepSeek
+  load has been run yet. oMLX's kernels are Metal, so this backend cannot run
+  on Linux.

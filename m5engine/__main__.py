@@ -32,6 +32,12 @@ def _add_load_args(p: argparse.ArgumentParser, require_model: bool) -> None:
     p.add_argument("--no-warm", action="store_true", help="Don't pre-read hot experts at load")
     p.add_argument("--no-elastic-cache", action="store_true",
                    help="Keep the expert cache at its base size instead of borrowing unused KV budget")
+    p.add_argument("--expert-resident-fraction", type=float,
+                   help="DeepSeek V4.1 (oMLX backend): share of each layer's experts kept in memory "
+                        "(default: the largest that fits)")
+    p.add_argument("--engram-in-memory", action="store_true",
+                   help="DeepSeek V4.1: keep the Engram tables in memory instead of reading them from the SSD")
+    p.add_argument("--no-ced-prefill", action="store_true", help="DeepSeek V4.1: disable oMLX's CED prefill path")
     p.add_argument("--draft-model", help="Small model with the same tokenizer for speculative decoding")
     p.add_argument("--num-draft-tokens", type=int, default=3)
     p.add_argument("--prefill-step", type=int, default=2048)
@@ -55,6 +61,9 @@ def _options(a) -> dict:
         "expert_pack": not a.no_expert_pack,
         "warm_experts": not a.no_warm,
         "elastic_expert_cache": not a.no_elastic_cache,
+        "expert_resident_fraction": a.expert_resident_fraction,
+        "engram_ssd": not a.engram_in_memory,
+        "ced_prefill": not a.no_ced_prefill,
         "io_threads": a.io_threads,
         "prefetch_experts": not a.no_prefetch,
         "draft_model": a.draft_model,

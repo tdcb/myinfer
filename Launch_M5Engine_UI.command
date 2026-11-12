@@ -8,7 +8,9 @@ MODEL=${2:-}
 
 if [ ! -d ".venv" ]; then
   echo "[*] Creating Python environment (.venv) and installing MLX..."
-  python3 -m venv .venv || exit 1
+  PY=python3
+  for c in python3.13 python3.12 python3.11; do command -v "$c" >/dev/null 2>&1 && { PY="$c"; break; }; done
+  "$PY" -m venv .venv || exit 1
   ./.venv/bin/pip install -q --upgrade pip
   ./.venv/bin/pip install -q -r requirements.txt || exit 1
 fi
