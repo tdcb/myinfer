@@ -2,16 +2,22 @@
 
 Everything except the routed experts (embeddings, attention, norms, routers,
 shared experts) is loaded normally. Routed expert weights stay on disk and are
-read on demand into a bounded LRU cache:
+read on demand into a bounded expert cache:
 
 * MLX-format checkpoints already store each MoE layer's experts stacked as
   ``[num_experts, ...]`` tensors, so one expert is a contiguous byte range per
-  tensor and can be read with a single ``pread`` (no repacking needed).
+  tensor and can be read with a single ``pread`` per tensor. ``repack_experts``
+  optionally writes a sidecar where every expert's tensors sit together, so an
+  expert is one read instead of one per tensor (quantized experts have 9).
 * Each MoE layer evaluates its router, reads back the chosen expert ids, loads
   any missing experts in parallel, and runs the stock ``gather_qmm`` path on a
   compact stack of just those experts.
 * During decode the next layer's router is applied to the current hidden state
   to guess its experts and start reading them early.
+* An ``ExpertProfile`` keeps a decayed count of how often each expert is routed
+  to. The cache evicts the coldest expert instead of the least recent one, and
+  at load the hottest experts from the saved profile are read in the background
+  so a fresh process starts warm (Strata's hot-expert profile, on unified memory).
 * On macOS reads use ``F_NOCACHE`` so expert bytes are not cached twice (page
   cache + expert cache).
 """
@@ -19,7 +25,9 @@ read on demand into a bounded LRU cache:
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
+import logging
 import os
 import platform
 import struct
@@ -29,7 +37,7 @@ from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -37,7 +45,13 @@ import numpy as np
 from mlx.utils import tree_flatten
 from mlx_lm.models.switch_layers import SwitchGLU, SwitchMLP
 
+log = logging.getLogger(__name__)
+
 F_NOCACHE = 48
+SIDECAR_DIR = ".m5engine"
+PROFILE_FILE = "expert-profile.npz"
+PACK_FILE = "experts.pack"
+_PACK_MAGIC = b"M5XP0001"
 
 _NP_DTYPES = {
     "U8": (np.uint8, None),
@@ -59,7 +73,6 @@ class TensorLocation:
     shape: Tuple[int, ...]
     start: int
     end: int
-
 
 
 @dataclass
@@ -90,6 +103,9 @@ class ExpertTensor:
             return self.stacked.file, self.stacked.start + expert * n, n
         loc = self.per_expert[expert]
         return loc.file, loc.start, loc.end - loc.start
+
+
+LayerLocs = Dict[str, ExpertTensor]
 
 
 def locate_expert_tensor(
@@ -134,14 +150,29 @@ def read_safetensors_index(model_path: Path) -> Dict[str, TensorLocation]:
     return index
 
 
-class ExpertReader:
-    """Reads one expert's slice of a stacked tensor from disk."""
+def _pread_into(fd: int, buf: np.ndarray, offset: int, path: str) -> None:
+    nbytes = buf.nbytes
+    view = memoryview(buf)
+    got = 0
+    while got < nbytes:
+        n = os.preadv(fd, [view[got:]], offset + got) if hasattr(os, "preadv") else None
+        if n is None:
+            chunk = os.pread(fd, nbytes - got, offset + got)
+            view[got : got + len(chunk)] = chunk
+            n = len(chunk)
+        if n <= 0:
+            raise IOError(f"Short read from {path} at {offset + got}")
+        got += n
+
+
+class _Files:
+    """Read-only descriptors, opened once, with the page cache bypassed on macOS."""
 
     def __init__(self):
         self._fds: Dict[str, int] = {}
         self._lock = threading.Lock()
 
-    def _fd(self, path: str) -> int:
+    def fd(self, path: str) -> int:
         with self._lock:
             fd = self._fds.get(path)
             if fd is None:
@@ -154,24 +185,6 @@ class ExpertReader:
                 self._fds[path] = fd
             return fd
 
-    def read(self, loc: ExpertTensor, expert: int) -> np.ndarray:
-        np_dtype, _ = _NP_DTYPES[loc.dtype]
-        path, offset, nbytes = loc.byte_range(expert)
-        buf = np.empty(nbytes, dtype=np.uint8)
-        fd = self._fd(path)
-        view = memoryview(buf)
-        got = 0
-        while got < nbytes:
-            n = os.preadv(fd, [view[got:]], offset + got) if hasattr(os, "preadv") else None
-            if n is None:
-                chunk = os.pread(fd, nbytes - got, offset + got)
-                view[got : got + len(chunk)] = chunk
-                n = len(chunk)
-            if n <= 0:
-                raise IOError(f"Short read from {path} at {offset + got}")
-            got += n
-        return buf.view(np_dtype).reshape(loc.shape)
-
     def close(self):
         with self._lock:
             for fd in self._fds.values():
@@ -179,10 +192,241 @@ class ExpertReader:
             self._fds.clear()
 
 
+class ExpertReader:
+    """Reads one expert's slice of a stacked tensor from disk."""
+
+    def __init__(self):
+        self.files = _Files()
+
+    def read(self, loc: ExpertTensor, expert: int) -> np.ndarray:
+        np_dtype, _ = _NP_DTYPES[loc.dtype]
+        path, offset, nbytes = loc.byte_range(expert)
+        buf = np.empty(nbytes, dtype=np.uint8)
+        _pread_into(self.files.fd(path), buf, offset, path)
+        return buf.view(np_dtype).reshape(loc.shape)
+
+    def read_expert(self, locs: LayerLocs, expert: int) -> Dict[str, np.ndarray]:
+        return {rel: self.read(loc, expert) for rel, loc in locs.items()}
+
+    def close(self):
+        self.files.close()
+
+
 def to_mx(arr: np.ndarray, st_dtype: str) -> mx.array:
     _, view_as = _NP_DTYPES[st_dtype]
     a = mx.array(arr)
     return a.view(view_as) if view_as is not None else a
+
+
+# ------------------------------------------------------------------ pack
+
+
+def _locs_fingerprint(layer_locs: Sequence[LayerLocs]) -> str:
+    """Identifies the source tensors: their layout plus each source file's size and mtime,
+    so a re-downloaded or re-quantized checkpoint with the same shapes still invalidates the pack."""
+    desc = [
+        [
+            (rel, Path(t.byte_range(0)[0]).name, t.dtype, list(t.shape), t.byte_range(0)[1], t.total_bytes)
+            for rel, t in sorted(locs.items())
+        ]
+        for locs in layer_locs
+    ]
+    files = sorted({t.byte_range(0)[0] for locs in layer_locs for t in locs.values()})
+    stats = []
+    for f in files:
+        st = os.stat(f)
+        stats.append((Path(f).name, st.st_size, st.st_mtime_ns))
+    return hashlib.sha1(json.dumps([desc, stats]).encode()).hexdigest()
+
+
+class ExpertPack:
+    """Sidecar file with every expert's tensors contiguous: one read per expert.
+
+    Layout: magic, u64 header length, JSON header, then for each layer, for each
+    expert, its tensors in ``rels`` order. Built once by ``repack_experts``; the
+    header records a fingerprint of the source tensors so a re-downloaded or
+    re-quantized checkpoint invalidates it.
+    """
+
+    def __init__(self, path: Path, header: dict, data_start: int):
+        self.path = str(path)
+        self.header = header
+        self.data_start = data_start  # layer offsets in the header are relative to this
+        self.files = _Files()
+        self._layers = header["layers"]
+
+    @staticmethod
+    def sidecar(model_path: Path) -> Path:
+        return Path(model_path) / SIDECAR_DIR / PACK_FILE
+
+    @classmethod
+    def open(cls, model_path: Path, layer_locs: Sequence[LayerLocs]) -> Optional["ExpertPack"]:
+        p = cls.sidecar(model_path)
+        if not p.exists():
+            return None
+        try:
+            with open(p, "rb") as fh:
+                if fh.read(len(_PACK_MAGIC)) != _PACK_MAGIC:
+                    return None
+                (n,) = struct.unpack("<Q", fh.read(8))
+                header = json.loads(fh.read(n))
+        except (OSError, ValueError):
+            return None
+        if header.get("fingerprint") != _locs_fingerprint(layer_locs) or not header.get("complete"):
+            log.warning("Expert pack %s does not match the checkpoint; ignoring it", p)
+            return None
+        return cls(p, header, len(_PACK_MAGIC) + 8 + n)
+
+    def read(self, layer: int, expert: int) -> Dict[str, np.ndarray]:
+        L = self._layers[layer]
+        stride = L["stride"]
+        buf = np.empty(stride, dtype=np.uint8)
+        _pread_into(self.files.fd(self.path), buf, self.data_start + L["offset"] + expert * stride, self.path)
+        out = {}
+        pos = 0
+        for rel, dtype, shape, size in zip(L["rels"], L["dtypes"], L["shapes"], L["sizes"]):
+            np_dtype, _ = _NP_DTYPES[dtype]
+            out[rel] = buf[pos : pos + size].view(np_dtype).reshape(shape)
+            pos += size
+        return out
+
+    def close(self):
+        self.files.close()
+
+
+def write_expert_pack(
+    model_path: Path,
+    layer_locs: Sequence[LayerLocs],
+    num_experts: Sequence[int],
+    progress: Optional[Callable[[int, int], None]] = None,
+) -> Path:
+    """Write the contiguous expert sidecar; returns its path."""
+    out = ExpertPack.sidecar(model_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    layers = []
+    offset = 0
+    for locs, n in zip(layer_locs, num_experts):
+        rels = sorted(locs)
+        sizes = [locs[r].per_expert_bytes for r in rels]
+        stride = sum(sizes)
+        layers.append({
+            "rels": rels, "sizes": sizes, "dtypes": [locs[r].dtype for r in rels],
+            "shapes": [list(locs[r].shape) for r in rels], "stride": stride, "experts": n, "offset": offset,
+        })
+        offset += stride * n
+    header = {"layers": layers, "fingerprint": _locs_fingerprint(layer_locs), "complete": False, "bytes": offset}
+    hdr = json.dumps(header).encode()
+    reader = ExpertReader()
+    tmp = out.with_suffix(".tmp")
+    total = offset
+    done = 0
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(_PACK_MAGIC + struct.pack("<Q", len(hdr)) + hdr)
+            for locs, L in zip(layer_locs, layers):
+                for e in range(L["experts"]):
+                    for rel in L["rels"]:
+                        fh.write(reader.read(locs[rel], e).tobytes())
+                    done += L["stride"]
+                    if progress is not None:
+                        progress(done, total)
+            # Same byte length as the header written above ("false" -> "true ").
+            fh.seek(len(_PACK_MAGIC) + 8)
+            fh.write(hdr.replace(b'"complete": false', b'"complete": true '))
+        os.replace(tmp, out)
+    finally:
+        reader.close()
+        if tmp.exists():
+            tmp.unlink()
+    return out
+
+
+# --------------------------------------------------------------- profile
+
+
+class ExpertProfile:
+    """Decayed routing frequency per (layer, expert).
+
+    Each MoE layer call adds its routing counts normalised to one token, and the
+    first layer's call decays everything first, so one step of decode and one
+    chunk of prefill weigh the same. Scores order evictions and the warm fill.
+    """
+
+    def __init__(self, layers: int, num_experts: int, decay: float = 0.998):
+        self.scores = np.zeros((layers, num_experts), dtype=np.float64)
+        self.decay = decay
+        self.steps = 0
+        self.dirty = False
+        self.paused = False  # e.g. while the engine measures the KV footprint with dummy tokens
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def sidecar(model_path: Path) -> Path:
+        return Path(model_path) / SIDECAR_DIR / PROFILE_FILE
+
+    @classmethod
+    def load(cls, model_path: Path, layers: int, num_experts: int) -> "ExpertProfile":
+        prof = cls(layers, num_experts)
+        p = cls.sidecar(model_path)
+        if p.exists():
+            try:
+                with np.load(p) as z:
+                    scores = z["scores"]
+                    if scores.shape == (layers, num_experts):
+                        prof.scores = scores.astype(np.float64)
+                        prof.steps = int(z["steps"])
+                    else:
+                        log.warning("Expert profile %s has shape %s, expected %s; starting fresh",
+                                    p, scores.shape, (layers, num_experts))
+            except (OSError, ValueError, KeyError) as e:
+                log.warning("Could not read expert profile %s: %s", p, e)
+        return prof
+
+    def save(self, model_path: Path) -> Optional[Path]:
+        if not self.dirty:
+            return None
+        p = self.sidecar(model_path)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp.npz")
+            with self._lock:
+                np.savez(tmp, scores=self.scores.astype(np.float32), steps=np.int64(self.steps))
+                self.dirty = False
+            os.replace(tmp, p)
+            return p
+        except OSError as e:
+            log.warning("Could not save expert profile to %s: %s", p, e)
+            return None
+
+    def record(self, layer: int, inds: np.ndarray) -> None:
+        if self.paused:
+            return
+        counts = np.bincount(inds.ravel().astype(np.int64), minlength=self.scores.shape[1])
+        n_tokens = inds.size // max(inds.shape[-1], 1)
+        with self._lock:
+            if layer == 0:
+                self.scores *= self.decay
+                self.steps += 1
+            self.scores[layer] += counts[: self.scores.shape[1]] / max(n_tokens, 1)
+            self.dirty = True
+
+    @property
+    def observed(self) -> int:
+        return int(np.count_nonzero(self.scores))
+
+    def ranked(self) -> np.ndarray:
+        """(layer, expert) pairs with a non-zero score, hottest first."""
+        with self._lock:
+            flat = self.scores.ravel()
+            order = np.argsort(-flat, kind="stable")
+            order = order[flat[order] > 0]
+        return np.stack(np.unravel_index(order, self.scores.shape), axis=1)
+
+    def to_dict(self) -> dict:
+        return {"steps": self.steps, "observed_experts": self.observed, "size": int(self.scores.size)}
+
+
+# ----------------------------------------------------------------- cache
 
 
 @dataclass
@@ -194,6 +438,7 @@ class StreamStats:
     bytes_read: int = 0
     read_seconds: float = 0.0
     evictions: int = 0
+    warmed: int = 0
 
     def to_dict(self) -> dict:
         total = self.hits + self.misses
@@ -208,30 +453,53 @@ class StreamStats:
             if self.read_seconds
             else 0.0,
             "evictions": self.evictions,
+            "warmed": self.warmed,
         }
 
 
 class ExpertCache:
-    """Byte-bounded LRU of experts keyed by (layer, expert)."""
+    """Byte-bounded cache of experts keyed by (layer, expert).
 
-    def __init__(self, capacity_bytes: int, io_threads: int = 8):
+    Eviction drops the expert with the lowest profile score (oldest first on
+    ties); without a profile it is a plain LRU. ``set_capacity`` resizes it at
+    run time so unused KV-cache budget can hold experts between long requests.
+    """
+
+    def __init__(
+        self,
+        capacity_bytes: int,
+        io_threads: int = 8,
+        profile: Optional[ExpertProfile] = None,
+        pack: Optional[ExpertPack] = None,
+    ):
         self.capacity_bytes = int(capacity_bytes)
         self.reader = ExpertReader()
+        self.pack = pack
+        self.profile = profile
         self.pool = ThreadPoolExecutor(max_workers=io_threads, thread_name_prefix="m5-expert-io")
+        self._warm_pool: Optional[ThreadPoolExecutor] = None
         self._entries: "OrderedDict[Tuple[int, int], Tuple[Dict[str, mx.array], int]]" = OrderedDict()
         self._inflight: Dict[Tuple[int, int], Future] = {}
         self._prefetched: set = set()
         self._bytes = 0
         self.stats = StreamStats()
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # stats
+        self._elock = threading.RLock()  # entries
+        self._closed = False
 
     @property
     def used_bytes(self) -> int:
         return self._bytes
 
-    def _read_expert(self, locs: Dict[str, ExpertTensor], expert: int):
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __contains__(self, key) -> bool:
+        return key in self._entries
+
+    def _read_expert(self, locs: LayerLocs, layer: int, expert: int) -> Dict[str, np.ndarray]:
         t0 = time.perf_counter()
-        out = {rel: self.reader.read(loc, expert) for rel, loc in locs.items()}
+        out = self.pack.read(layer, expert) if self.pack is not None else self.reader.read_expert(locs, expert)
         nbytes = sum(a.nbytes for a in out.values())
         with self._lock:
             self.stats.read_seconds += time.perf_counter() - t0
@@ -241,11 +509,11 @@ class ExpertCache:
     def _submit(self, key, locs):
         fut = self._inflight.get(key)
         if fut is None:
-            fut = self.pool.submit(self._read_expert, locs, key[1])
+            fut = self.pool.submit(self._read_expert, locs, key[0], key[1])
             self._inflight[key] = fut
         return fut
 
-    def prefetch(self, layer: int, experts: Sequence[int], locs: Dict[str, ExpertTensor]) -> None:
+    def prefetch(self, layer: int, experts: Sequence[int], locs: LayerLocs) -> None:
         for e in experts:
             key = (layer, int(e))
             if key in self._entries or key in self._inflight:
@@ -254,38 +522,55 @@ class ExpertCache:
             self._prefetched.add(key)
             self.stats.prefetch_issued += 1
 
+    def _evict_to(self, target: int, protect: set) -> None:
+        with self._elock:
+            if self._bytes <= target:
+                return
+            cands = [k for k in self._entries if k not in protect]
+            if not cands:
+                return
+            if self.profile is not None:
+                arr = np.array(cands)
+                order = np.argsort(self.profile.scores[arr[:, 0], arr[:, 1]], kind="stable")
+            else:
+                order = range(len(cands))  # insertion (recency) order
+            for i in order:
+                if self._bytes <= target:
+                    break
+                _, old_bytes = self._entries.pop(cands[i])
+                self._bytes -= old_bytes
+                self.stats.evictions += 1
+
     def _insert(self, key, arrays: Dict[str, mx.array], protect: set) -> None:
         nbytes = sum(a.nbytes for a in arrays.values())
-        self._entries[key] = (arrays, nbytes)
-        self._bytes += nbytes
-        while self._bytes > self.capacity_bytes and self._entries:
-            old_key = next(iter(self._entries))
-            if old_key in protect:
-                if len(protect) >= len(self._entries):
-                    break
-                self._entries.move_to_end(old_key)
-                continue
-            _, old_bytes = self._entries.pop(old_key)
-            self._bytes -= old_bytes
-            self.stats.evictions += 1
+        with self._elock:
+            self._entries[key] = (arrays, nbytes)
+            self._bytes += nbytes
+            if self._bytes > self.capacity_bytes:
+                # Evict a little past the line so the scan is not repeated for every insert.
+                slack = min(8 * nbytes, self.capacity_bytes // 50)
+                self._evict_to(self.capacity_bytes - slack, protect | {key})
 
-    def fetch(
-        self,
-        layer: int,
-        experts: Sequence[int],
-        locs: Dict[str, ExpertTensor],
-    ) -> List[Dict[str, mx.array]]:
+    def set_capacity(self, capacity_bytes: int) -> None:
+        capacity_bytes = max(0, int(capacity_bytes))
+        if capacity_bytes == self.capacity_bytes:
+            return
+        self.capacity_bytes = capacity_bytes
+        self._evict_to(capacity_bytes, set())
+
+    def fetch(self, layer: int, experts: Sequence[int], locs: LayerLocs) -> List[Dict[str, mx.array]]:
         keys = [(layer, int(e)) for e in experts]
         protect = set(keys)
         found: Dict[Tuple[int, int], Dict[str, mx.array]] = {}
-        for key in keys:
-            entry = self._entries.get(key)
-            if entry is not None:
-                self._entries.move_to_end(key)
-                found[key] = entry[0]
-                self.stats.hits += 1
-            else:
-                self._submit(key, locs)
+        with self._elock:
+            for key in keys:
+                entry = self._entries.get(key)
+                if entry is not None:
+                    self._entries.move_to_end(key)
+                    found[key] = entry[0]
+                    self.stats.hits += 1
+                else:
+                    self._submit(key, locs)
         for key in keys:
             if key in found:
                 continue
@@ -296,13 +581,17 @@ class ExpertCache:
             else:
                 self.stats.misses += 1
             arrays = {rel: to_mx(a, locs[rel].dtype) for rel, a in raw.items()}
-            self._insert(key, arrays, protect)
+            with self._elock:
+                if key in self._entries:  # the warm fill got there first
+                    arrays = self._entries[key][0]
+                else:
+                    self._insert(key, arrays, protect)
             found[key] = arrays
         self._settle_mispredicted(layer, protect, locs)
         return [found[k] for k in keys]
 
-    def _settle_mispredicted(self, layer: int, protect: set, locs: Dict[str, ExpertTensor]) -> None:
-        """Move unused prefetches for this layer into the LRU so they stay bounded."""
+    def _settle_mispredicted(self, layer: int, protect: set, locs: LayerLocs) -> None:
+        """Move unused prefetches for this layer into the cache so they stay bounded."""
         stale = [k for k in self._prefetched if k[0] == layer and k not in protect]
         for key in stale:
             self._prefetched.discard(key)
@@ -310,16 +599,81 @@ class ExpertCache:
             if fut is None:
                 continue
             raw = fut.result()
-            self._insert(key, {rel: to_mx(a, locs[rel].dtype) for rel, a in raw.items()}, protect)
+            with self._elock:
+                if key not in self._entries:
+                    self._insert(key, {rel: to_mx(a, locs[rel].dtype) for rel, a in raw.items()}, protect)
+
+    # ------------------------------------------------------------ warm fill
+    def warm(self, layer_locs: Sequence[LayerLocs], limit_bytes: Optional[int] = None, threads: int = 2) -> int:
+        """Read the profile's hottest experts in the background until the cache is ~full.
+
+        Returns how many experts were scheduled. Reads use their own small pool
+        so a request arriving mid-fill still gets the main I/O threads.
+        """
+        if self.profile is None or self._closed:
+            return 0
+        limit = self.capacity_bytes if limit_bytes is None else min(limit_bytes, self.capacity_bytes)
+        sizes = [sum(t.per_expert_bytes for t in locs.values()) for locs in layer_locs]
+        planned: List[Tuple[int, int]] = []
+        total = self._bytes
+        for layer, expert in self.profile.ranked():
+            key = (int(layer), int(expert))
+            if key in self._entries or total + sizes[key[0]] > limit:
+                continue
+            planned.append(key)
+            total += sizes[key[0]]
+        if not planned:
+            return 0
+        if self._warm_pool is None:
+            self._warm_pool = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="m5-expert-warm")
+
+        def job(keys: List[Tuple[int, int]]):
+            for key in keys:
+                if self._closed:
+                    return
+                if key in self._entries or key in self._inflight:
+                    continue
+                locs = layer_locs[key[0]]
+                raw = self._read_expert(locs, key[0], key[1])
+                arrays = {rel: to_mx(a, locs[rel].dtype) for rel, a in raw.items()}
+                nbytes = sum(a.nbytes for a in arrays.values())
+                with self._elock:
+                    if key in self._entries or self._bytes + nbytes > self.capacity_bytes:
+                        continue
+                    self._entries[key] = (arrays, nbytes)
+                    self._entries.move_to_end(key, last=False)  # colder than anything used since
+                    self._bytes += nbytes
+                    self.stats.warmed += 1
+
+        for i in range(threads):
+            self._warm_pool.submit(job, planned[i::threads])
+        return len(planned)
+
+    def wait_warm(self, timeout: Optional[float] = None) -> None:
+        if self._warm_pool is not None:
+            self._warm_pool.shutdown(wait=True)
+            self._warm_pool = None
+
+    def reset_stats(self) -> None:
+        self.stats = StreamStats()
 
     def clear(self) -> None:
-        self._entries.clear()
-        self._bytes = 0
+        with self._elock:
+            self._entries.clear()
+            self._bytes = 0
 
     def close(self) -> None:
+        self._closed = True
+        if self._warm_pool is not None:
+            self._warm_pool.shutdown(wait=True, cancel_futures=True)
         self.pool.shutdown(wait=False, cancel_futures=True)
         self.reader.close()
+        if self.pack is not None:
+            self.pack.close()
         self.clear()
+
+
+# ------------------------------------------------------------- modules
 
 
 def _get_by_path(root: nn.Module, path: str):
@@ -337,12 +691,54 @@ def _set_attr_path(root: nn.Module, rel: str, value) -> None:
     setattr(obj, leaf, value)
 
 
+_TOP_K_NAMES = ("num_experts_per_tok", "top_k", "n_activated_experts", "k")  # "k": Ernie
+
+
 def _router_top_k(parent: nn.Module, default: int) -> int:
-    for name in ("num_experts_per_tok", "top_k", "k", "n_activated_experts"):
-        v = getattr(parent, name, None)
-        if isinstance(v, int) and v > 0:
-            return v
+    for obj in (parent, parent.get("gate") if isinstance(parent, nn.Module) else None):
+        if obj is None:
+            continue
+        for name in _TOP_K_NAMES:
+            v = getattr(obj, name, None)
+            if isinstance(v, int) and v > 0:
+                return v
     return default
+
+
+def set_active_experts(model: nn.Module, k: int) -> Tuple[int, int]:
+    """Route each token to ``k`` experts instead of the model's default (Strata's "Speed" setting).
+
+    Patches the top-k attribute on every MoE block and its router. Returns
+    (default_k, layers_patched). Fewer experts read less from the SSD per
+    token at a small quality cost; more than the default is refused.
+    """
+    modules = find_expert_modules(model)
+    if not modules:
+        raise ValueError("active_experts only applies to Mixture-of-Experts models.")
+
+    def block_of(path: str) -> nn.Module:
+        if path.endswith(".inner"):  # already wrapped by StreamingExperts
+            path = path[: -len(".inner")]
+        return _get_by_path(model, path.rsplit(".", 1)[0])
+
+    default = _router_top_k(block_of(modules[0][0]), 0)
+    if default <= 0:
+        raise ValueError("Could not find this model's experts-per-token setting to override.")
+    if not 1 <= k <= default:
+        raise ValueError(f"active_experts must be between 1 and the model's default {default}.")
+    patched = 0
+    for path, _ in modules:
+        parent = block_of(path)
+        hit = False
+        for obj in (parent, parent.get("gate")):
+            if obj is None:
+                continue
+            for name in _TOP_K_NAMES:
+                if isinstance(getattr(obj, name, None), int):
+                    setattr(obj, name, k)
+                    hit = True
+        patched += hit
+    return default, patched
 
 
 class StreamingExperts(nn.Module):
@@ -352,7 +748,7 @@ class StreamingExperts(nn.Module):
         self,
         inner: nn.Module,
         layer_id: int,
-        locs: Dict[str, ExpertTensor],
+        locs: LayerLocs,
         cache: ExpertCache,
         num_experts: int,
     ):
@@ -388,6 +784,8 @@ class StreamingExperts(nn.Module):
             mx.eval(indices)
         inds = np.array(indices)
         uniq = np.unique(inds)
+        if self._cache.profile is not None:
+            self._cache.profile.record(self._layer_id, inds)
         if pred is not None:
             nxt._cache.prefetch(nxt._layer_id, np.unique(np.array(pred)).tolist(), nxt._locs)
 
@@ -410,6 +808,9 @@ class StreamingInfo:
     expert_bytes: int
     total_expert_bytes: int
     cache: ExpertCache
+    layer_locs: List[LayerLocs]
+    base_capacity_bytes: int = 0
+    warm_scheduled: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -418,8 +819,14 @@ class StreamingInfo:
             "expert_mb": round(self.expert_bytes / 1024**2, 2),
             "total_expert_gb": round(self.total_expert_bytes / 1024**3, 2),
             "cache_capacity_gb": round(self.cache.capacity_bytes / 1024**3, 2),
+            "cache_base_gb": round(self.base_capacity_bytes / 1024**3, 2),
             "cache_used_gb": round(self.cache.used_bytes / 1024**3, 2),
             "cache_slots": int(self.cache.capacity_bytes // max(self.expert_bytes, 1)),
+            "cached_experts": len(self.cache),
+            "resident_fraction": round(len(self.cache) / max(self.layers * self.num_experts, 1), 4),
+            "packed": self.cache.pack is not None,
+            "profile": self.cache.profile.to_dict() if self.cache.profile else None,
+            "warm_scheduled": self.warm_scheduled,
             **self.cache.stats.to_dict(),
         }
 
@@ -438,13 +845,35 @@ def find_expert_modules(model: nn.Module) -> List[Tuple[str, nn.Module]]:
     return sorted(found, key=lambda pm: _path_order(pm[0]))
 
 
-def estimate_expert_bytes(model_path: Path, model: nn.Module) -> int:
+def locate_all_experts(model_path: Path, model: nn.Module) -> Tuple[List[LayerLocs], List[int]]:
+    """Per MoE layer: where each expert parameter lives, and the layer's expert count."""
     index = read_safetensors_index(model_path)
-    total = 0
+    layer_locs: List[LayerLocs] = []
+    counts: List[int] = []
     for path, inner in find_expert_modules(model):
-        for rel, arr in tree_flatten(inner.parameters()):
-            total += locate_expert_tensor(index, path, rel, tuple(arr.shape)).total_bytes
-    return total
+        params = tree_flatten(inner.parameters())
+        locs: LayerLocs = {}
+        for rel, arr in params:
+            locs[rel] = locate_expert_tensor(index, path, rel, tuple(arr.shape))
+            if locs[rel].dtype not in _NP_DTYPES:
+                raise ValueError(f"Unsupported expert dtype {locs[rel].dtype} for {path}.{rel}")
+        layer_locs.append(locs)
+        counts.append(params[0][1].shape[0])
+    return layer_locs, counts
+
+
+def estimate_expert_bytes(model_path: Path, model: nn.Module) -> int:
+    layer_locs, _ = locate_all_experts(model_path, model)
+    return sum(t.total_bytes for locs in layer_locs for t in locs.values())
+
+
+def repack_experts(model: nn.Module, model_path: Path,
+                   progress: Optional[Callable[[int, int], None]] = None) -> Path:
+    """Write the contiguous expert sidecar for a lazily loaded MoE model."""
+    layer_locs, counts = locate_all_experts(model_path, model)
+    if not layer_locs:
+        raise ValueError("This model has no routed-expert layers to repack.")
+    return write_expert_pack(model_path, layer_locs, counts, progress)
 
 
 def enable_expert_streaming(
@@ -453,33 +882,30 @@ def enable_expert_streaming(
     cache_bytes: int,
     io_threads: int = 8,
     prefetch: bool = True,
+    profile: bool = True,
+    use_pack: bool = True,
+    warm: bool = True,
 ) -> StreamingInfo:
     """Replace routed experts with disk-backed streaming modules.
 
     Must be called on a lazily loaded model *before* its parameters are
     evaluated, so the full expert tensors are never read into memory.
     """
-    index = read_safetensors_index(model_path)
     modules = find_expert_modules(model)
     if not modules:
         raise ValueError("Expert streaming requested but the model has no routed-expert layers.")
-    cache = ExpertCache(cache_bytes, io_threads=io_threads)
+    layer_locs, counts = locate_all_experts(model_path, model)
+    num_experts = max(counts)
+    prof = ExpertProfile.load(model_path, len(modules), num_experts) if profile else None
+    pack = ExpertPack.open(model_path, layer_locs) if use_pack else None
+    cache = ExpertCache(cache_bytes, io_threads=io_threads, profile=prof, pack=pack)
     wrappers: List[Tuple[nn.Module, StreamingExperts]] = []
     expert_bytes = 0
     total = 0
-    num_experts = 0
-    for layer_id, (path, inner) in enumerate(modules):
-        locs: Dict[str, ExpertTensor] = {}
-        params = tree_flatten(inner.parameters())
-        for rel, arr in params:
-            locs[rel] = locate_expert_tensor(index, path, rel, tuple(arr.shape))
-            if locs[rel].dtype not in _NP_DTYPES:
-                raise ValueError(f"Unsupported expert dtype {locs[rel].dtype} for {path}.{rel}")
-        n_exp = params[0][1].shape[0]
-        num_experts = max(num_experts, n_exp)
+    for layer_id, ((path, inner), locs, n_exp) in enumerate(zip(modules, layer_locs, counts)):
         expert_bytes = max(expert_bytes, sum(l.per_expert_bytes for l in locs.values()))
         total += sum(l.total_bytes for l in locs.values())
-        for rel, arr in params:
+        for rel, arr in tree_flatten(inner.parameters()):
             _set_attr_path(inner, rel, mx.zeros((1, *arr.shape[1:]), dtype=arr.dtype))
         parent_path, attr = path.rsplit(".", 1)
         parent = _get_by_path(model, parent_path)
@@ -493,4 +919,10 @@ def enable_expert_streaming(
             if gate is not None and callable(gate):
                 w.set_next(gate, nw, _router_top_k(nparent, 8))
 
-    return StreamingInfo(len(wrappers), num_experts, expert_bytes, total, cache)
+    info = StreamingInfo(len(wrappers), num_experts, expert_bytes, total, cache, layer_locs, cache_bytes)
+    if warm and prof is not None and prof.steps:
+        info.warm_scheduled = cache.warm(layer_locs)
+        if info.warm_scheduled:
+            log.info("Warming the expert cache with %d experts from the saved profile (%d steps)",
+                     info.warm_scheduled, prof.steps)
+    return info

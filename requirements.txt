@@ -1,6 +1,8 @@
 # m5engine patches two mlx-lm internals (quantized attention, KV quantization);
 # bump mlx-lm deliberately and re-run `pytest tests` when upgrading.
+# mlx-lm >= 0.32 needs Python 3.11+; 0.31.x still works on 3.10.
 mlx>=0.32.4
-mlx-lm==0.31.3
+mlx-lm>=0.31.3,<0.33
 numpy
 huggingface_hub
+# DeepSeek-V4.1-Flash is served by the optional oMLX backend: tools/install_deepseek_backend.sh

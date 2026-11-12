@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import threading
 import time
@@ -33,7 +34,10 @@ from .context import (
     yarn_capable,
     yarn_factor_for,
 )
+from . import deepseek_v41 as dsv41
 from .expert_stream import (
+    repack_experts,
+    set_active_experts,
     StreamingInfo,
     enable_expert_streaming,
     estimate_expert_bytes,
@@ -68,6 +72,15 @@ class LoadOptions:
     expert_cache_gb: Optional[float] = None
     io_threads: int = 8
     prefetch_experts: bool = True
+    expert_profile: bool = True  # learn which experts are hot; saved next to the model
+    expert_pack: bool = True  # use the contiguous experts sidecar when one exists
+    warm_experts: bool = True  # pre-read the profile's hottest experts at load
+    elastic_expert_cache: bool = True  # lend unused KV budget to the expert cache
+    active_experts: Optional[int] = None  # route to fewer experts than the model's default
+    # DeepSeek V4.1 (oMLX backend): share of each layer's experts kept in memory (default: largest that fits)
+    expert_resident_fraction: Optional[float] = None
+    engram_ssd: bool = True  # serve the Engram n-gram tables from the SSD
+    ced_prefill: bool = True  # oMLX's Causal Encoder-Decoder prefill path
     draft_model: Optional[str] = None
     num_draft_tokens: int = 3
     prefill_step: int = 2048
@@ -119,6 +132,9 @@ class RequestMetrics:
     yarn_factor: float = 1.0
     peak_memory_gb: float = 0.0
     finish_reason: str = ""
+    expert_hit_rate: Optional[float] = None
+    ssd_mb_per_token: Optional[float] = None  # expert bytes read from disk per generated token
+    ssd_gb_read: float = 0.0
 
 
 def _param_bytes(model) -> int:
@@ -148,6 +164,9 @@ class Engine:
         self.plan: Optional[ContextPlan] = None
         self.footprint: Optional[KVFootprint] = None
         self.streaming: Optional[StreamingInfo] = None
+        self.default_active_experts: Optional[int] = None
+        self._requests_since_save = 0
+        self.dsv41: Optional[dsv41.Loaded] = None  # set when the oMLX DeepSeek V4.1 backend serves the model
         self.prefix = PrefixCache()
         self.resident_bytes = 0
         self.load_seconds = 0.0
@@ -177,9 +196,18 @@ class Engine:
 
     def _unload(self) -> None:
         if self.streaming:
+            self.save_profile()
             self.streaming.cache.close()
+        if self.dsv41 is not None:
+            close = getattr(self.model, "close", None)
+            if callable(close):
+                try:
+                    close()  # oMLX's expert store and Engram mappings hold raw descriptors
+                except Exception as e:
+                    log.warning("Closing the DeepSeek model failed: %s", e)
         self.model = self.draft_model = self.tokenizer = None
         self.streaming = None
+        self.dsv41 = None
         self.plan = None
         self.footprint = None
         self.prefix.clear()
@@ -209,6 +237,9 @@ class Engine:
         if opts.kv_bits not in (0, 4, 8):
             raise EngineError("kv_bits must be 0 (fp16), 4 or 8")
         path = _download(opts.model)
+        config = json.loads((Path(path) / "config.json").read_text())
+        if dsv41.is_deepseek_v41(config):
+            return self._load_deepseek_v41(opts, Path(path), config, t0)
         model, config = load_model(path, lazy=True)
         tokenizer = load_tokenizer(
             path,
@@ -240,6 +271,16 @@ class Engine:
                 "Use a smaller quantization, or a MoE model with expert streaming."
             )
 
+        if opts.active_experts is not None:
+            if not has_experts:
+                raise EngineError("active_experts only applies to Mixture-of-Experts models.")
+            try:
+                self.default_active_experts, _ = set_active_experts(model, opts.active_experts)
+            except ValueError as e:
+                raise EngineError(str(e)) from None
+        else:
+            self.default_active_experts = None
+
         streaming = None
         if stream:
             expert_total = estimate_expert_bytes(path, model)
@@ -257,7 +298,8 @@ class Engine:
                 cache_bytes = int(free * 0.5)
             cache_bytes = max(0, min(cache_bytes, expert_total, free - int(min_kv / 4)))
             streaming = enable_expert_streaming(
-                model, path, cache_bytes, io_threads=opts.io_threads, prefetch=opts.prefetch_experts
+                model, path, cache_bytes, io_threads=opts.io_threads, prefetch=opts.prefetch_experts,
+                profile=opts.expert_profile, use_pack=opts.expert_pack, warm=opts.warm_experts,
             )
 
         mx.eval(model.parameters())
@@ -268,11 +310,19 @@ class Engine:
             except Exception as e:  # pragma: no cover - macOS only
                 log.warning("Could not set wired limit: %s", e)
 
+        if streaming and streaming.cache.profile is not None:
+            streaming.cache.profile.paused = True  # the measurement below routes dummy tokens
         fp = measure_kv_footprint(model, opts.kv_bits, opts.kv_group_size)
         if opts.kv_bits and opts.quantized_kv_start:
             dense_fp = measure_kv_footprint(model, 0)
             extra = max(0.0, dense_fp.bytes_per_token - fp.bytes_per_token) * opts.quantized_kv_start
             fp = KVFootprint(fp.bytes_per_token, int(fp.fixed_bytes + extra), fp.kv_bits)
+        if streaming:
+            warmed = streaming.cache.stats.warmed
+            streaming.cache.reset_stats()
+            streaming.cache.stats.warmed = warmed
+            if streaming.cache.profile is not None:
+                streaming.cache.profile.paused = False
         if draft is not None:
             fp = combine(fp, measure_kv_footprint(draft, opts.kv_bits, opts.kv_group_size))
 
@@ -303,10 +353,68 @@ class Engine:
             self._set_yarn(plan.yarn_factor)
         self.load_seconds = time.perf_counter() - t0
         self.last = RequestMetrics()
+        self._requests_since_save = 0
         log.info(
             "Loaded %s in %.1fs: resident %.1f GB, max context %d (%s)",
             opts.model, self.load_seconds, resident_bytes / GB, plan.max_context, plan.limited_by,
         )
+
+    def _load_deepseek_v41(self, opts: LoadOptions, path: Path, config: dict, t0: float) -> None:
+        """Serve DeepSeek V4.1 through oMLX: Engram on SSD, bounded expert residency sized by our budget."""
+        try:
+            dsv41.require()
+        except RuntimeError as e:
+            raise EngineError(str(e)) from None
+        if opts.draft_model:
+            raise EngineError("DeepSeek V4.1 does not take a separate draft model.")
+        budget = self.budget_bytes(opts)
+        text_cfg = {**config, **config.get("text_config", {})}  # position/rope settings live in text_config
+        native, plain_limit = native_context(text_cfg)
+        hidden = int(text_cfg.get("hidden_size") or 5120)
+        reserve = reserve_bytes(budget, hidden, opts.prefill_step)
+        # DeepSeek's compressed KV is small (~1 KB/token); hold back the KV for the
+        # first 32K tokens before fitting experts, and plan the rest after measuring.
+        kv_hold = int(1024 * min(plain_limit, opts.max_context or 32768, 32768))
+        try:
+            plan_r = dsv41.plan_residency(path, budget - reserve - kv_hold, engram_ssd=opts.engram_ssd,
+                                          fraction=opts.expert_resident_fraction)
+            loaded = dsv41.load(path, plan_r, ced_prefill=opts.ced_prefill)
+        except RuntimeError as e:
+            raise EngineError(str(e)) from None
+        model, tokenizer = loaded.model, loaded.tokenizer
+        resident_bytes = max(_param_bytes(model), plan_r.admission_bytes)
+        if mx.metal.is_available():
+            try:
+                mx.set_wired_limit(min(budget, self.hw.recommended_working_set_bytes))
+            except Exception as e:  # pragma: no cover - macOS only
+                log.warning("Could not set wired limit: %s", e)
+        per_tok, fixed = dsv41.measure_cache_bytes(model)
+        fp = KVFootprint(per_tok, fixed, 0)
+        plan = plan_context(
+            config=text_cfg, footprint=fp, budget_bytes=budget, resident_weight_bytes=resident_bytes,
+            expert_cache_bytes=0, prefill_step=opts.prefill_step, rope_scaling="off",
+            requested_context=opts.max_context,
+        )
+        if plan.max_context < 512:
+            raise EngineError(
+                f"Only {plan.max_context} tokens of cache fit next to the resident experts; "
+                "lower expert_resident_fraction or pick a smaller checkpoint."
+            )
+        self.model, self.draft_model, self.tokenizer = model, None, tokenizer
+        self.config, self.options, self.model_path = config, opts, path
+        self.plan, self.footprint, self.streaming = plan, fp, None
+        self.dsv41 = loaded
+        self.resident_bytes = resident_bytes
+        self.prefix = PrefixCache(max_entries=0)  # oMLX's cache objects are not prefix-reusable here
+        self._native, self._plain_limit = native, plain_limit
+        self._yarn_now = 1.0
+        self.default_active_experts = None
+        self.load_seconds = time.perf_counter() - t0
+        self.last = RequestMetrics()
+        self._requests_since_save = 0
+        log.info("Loaded %s via oMLX in %.1fs: %d/%d experts per layer resident, max context %d (%s)",
+                 opts.model, self.load_seconds, plan_r.resident_experts, plan_r.experts_per_layer,
+                 plan.max_context, plan.limited_by)
 
     def _set_yarn(self, factor: float) -> None:
         if factor == self._yarn_now:
@@ -336,6 +444,11 @@ class Engine:
             if isinstance(content, list):
                 content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
             msgs.append({**m, "content": content or ""})
+        if self.dsv41 is not None:
+            kwargs = dict(chat_template_kwargs or {})
+            if tools:
+                kwargs["tools"] = tools
+            return dsv41.encode_chat(self.dsv41, msgs, kwargs)
         if getattr(tok, "chat_template", None):
             kwargs = dict(chat_template_kwargs or {})
             if tools:
@@ -369,15 +482,18 @@ class Engine:
             factor = self._yarn_for_request(len(tokens) + max_tokens)
             self._set_yarn(factor)
             key = f"yarn={factor}"
-            use_prefix = opts.prefix_cache and params.use_prefix_cache
+            use_prefix = opts.prefix_cache and params.use_prefix_cache and self.dsv41 is None
             cache, hit = (self.prefix.take(key, tokens) if use_prefix else (None, 0))
             if cache is None:
-                cache = make_prompt_cache(self.model)
+                cache = self.model.make_cache() if self.dsv41 is not None else make_prompt_cache(self.model)
                 if self.draft_model is not None:
                     cache += make_prompt_cache(self.draft_model)
                 hit = 0
             need = self.footprint.bytes_for(len(tokens) + max_tokens)
             self.prefix.evict_to(self.plan.kv_budget_bytes - need)
+            self._resize_expert_cache(need)
+            st = self.streaming.cache.stats if self.streaming else None
+            io0 = (st.hits, st.misses, st.bytes_read) if st else None
 
             if params.seed is not None:
                 mx.random.seed(params.seed)
@@ -398,10 +514,11 @@ class Engine:
                 logits_processors=processors,
                 prompt_cache=cache,
                 prefill_step_size=opts.prefill_step,
-                kv_bits=opts.kv_bits or None,
-                kv_group_size=opts.kv_group_size,
-                quantized_kv_start=opts.quantized_kv_start,
             )
+            if self.dsv41 is None:  # oMLX's cache keeps its own (compressed) KV format
+                kwargs.update(kv_bits=opts.kv_bits or None, kv_group_size=opts.kv_group_size,
+                              quantized_kv_start=opts.quantized_kv_start)
+            ds_before = dsv41.expert_stats(self.model) if self.dsv41 is not None else None
             if draft is not None:
                 kwargs["num_draft_tokens"] = opts.num_draft_tokens
 
@@ -417,14 +534,18 @@ class Engine:
             hold = max((len(s) for s in stop), default=1) - 1
             stopped = False
             try:
-                for resp in stream_generate(
+                steps = stream_generate(
                     self.model, self.tokenizer, mx.array(tokens[hit:]), max_tokens,
                     draft_model=draft, **kwargs,
-                ):
+                )
+                if self.dsv41 is not None:
+                    steps = dsv41.generate_with_prefill_scope(self.model, steps)
+                for resp in steps:
                     if t_first is None:
                         t_first = time.perf_counter()
                         m.ttft_ms = (t_first - t0) * 1000
                         m.prompt_tps = resp.prompt_tps
+                        decode_bytes0 = st.bytes_read if st else 0
                     if not (resp.finish_reason == "stop" and resp.token in self.tokenizer.eos_token_ids):
                         generated.append(resp.token)
                     m.draft_accepted += int(resp.from_draft)
@@ -451,7 +572,21 @@ class Engine:
                 m.completion_tokens = len(generated)
                 m.finish_reason = finish
                 m.peak_memory_gb = round(mx.get_peak_memory() / GB, 2)
+                if ds_before is not None:
+                    ds_after = dsv41.expert_stats(self.model) or ds_before
+                    hits = ds_after["hits"] - ds_before["hits"]
+                    misses = ds_after["misses"] - ds_before["misses"]
+                    m.expert_hit_rate = round(hits / (hits + misses), 4) if hits + misses else None
+                if st is not None:
+                    hits, misses = st.hits - io0[0], st.misses - io0[1]
+                    m.expert_hit_rate = round(hits / (hits + misses), 4) if hits + misses else None
+                    m.ssd_gb_read = round((st.bytes_read - io0[2]) / GB, 3)
+                    if t_first is not None and m.completion_tokens:
+                        m.ssd_mb_per_token = round((st.bytes_read - decode_bytes0) / 1024**2 / m.completion_tokens, 1)
                 self.last = m
+                self._requests_since_save += 1
+                if self.streaming and self._requests_since_save >= 5:
+                    self.save_profile()
                 self.totals["requests"] += 1
                 self.totals["prompt_tokens"] += m.prompt_tokens
                 self.totals["completion_tokens"] += m.completion_tokens
@@ -459,6 +594,50 @@ class Engine:
                 if use_prefix and (draft is not None or self.draft_model is None):
                     self.prefix.put(key, tokens + generated, cache)
             yield Chunk("", finish, m)
+
+    # ------------------------------------------------------- expert tiers
+    def _resize_expert_cache(self, kv_need_bytes: int) -> None:
+        """Lend the KV budget this request does not need to the expert cache (Strata's kv-grow).
+
+        The plan still guarantees the full context: the cache shrinks back to
+        its base size, evicting the coldest experts, when a longer request comes.
+        """
+        if not self.streaming:
+            return
+        cache = self.streaming.cache
+        base = self.streaming.base_capacity_bytes
+        if not self.options.elastic_expert_cache:
+            cache.set_capacity(base)
+            return
+        spare = self.plan.kv_budget_bytes - kv_need_bytes - self.prefix.nbytes
+        target = base + max(0, spare)
+        target = min(target, base + self.streaming.total_expert_bytes)
+        if target < cache.capacity_bytes:
+            cache.set_capacity(target)
+            mx.clear_cache()
+        else:
+            cache.set_capacity(target)
+
+    def save_profile(self) -> None:
+        if self.streaming and self.streaming.cache.profile is not None and self.model_path is not None:
+            self.streaming.cache.profile.save(self.model_path)
+            self._requests_since_save = 0
+
+    def repack(self, progress=None) -> Path:
+        """Write the contiguous expert sidecar for the loaded (or streaming) MoE model."""
+        if not self.loaded:
+            raise NotLoaded("No model loaded")
+        if not find_expert_modules(self.model) and not self.streaming:
+            raise EngineError("Repacking only applies to Mixture-of-Experts models.")
+        with self._gen_lock:
+            model = self.model
+            if self.streaming:
+                # The wrappers hide the SwitchGLU modules; locate via the recorded layouts.
+                from .expert_stream import write_expert_pack
+                counts = [max(t.stacked.shape[0] if t.stacked else len(t.per_expert) for t in locs.values())
+                          for locs in self.streaming.layer_locs]
+                return write_expert_pack(self.model_path, self.streaming.layer_locs, counts, progress)
+            return repack_experts(model, self.model_path, progress)
 
     # ------------------------------------------------------------ benchmark
     def benchmark(self, prompt_tokens: int = 1024, gen_tokens: int = 128, use_draft: bool = True) -> dict:
@@ -483,15 +662,13 @@ class Engine:
             n = max(1, n + prompt_tokens - len(tokens))
         params = GenerationParams(max_tokens=gen_tokens, temperature=0.0, use_prefix_cache=False,
                                   use_draft=use_draft)
-        st = self.streaming.cache.stats if self.streaming else None
-        before = (st.hits, st.misses) if st else (0, 0)
         m = None
         for chunk in self.generate(tokens, params):
             m = chunk.metrics or m
-        hit_rate = None
-        if st:
-            hits, misses = st.hits - before[0], st.misses - before[1]
-            hit_rate = round(hits / (hits + misses), 4) if hits + misses else 0.0
+        st = self.streaming.to_dict() if self.streaming else None
+        if self.dsv41 is not None:
+            ds = dsv41.expert_stats(self.model) or {}
+            st = {"cache_capacity_gb": None, "cached_experts": ds.get("resident_experts"), "packed": None}
         return {
             "time": time.time(),
             "model": self.options.model,
@@ -506,7 +683,13 @@ class Engine:
             "kv_bits": self.options.kv_bits,
             "max_context": self.plan.max_context,
             "expert_streaming": st is not None,
-            "expert_hit_rate": hit_rate,
+            "expert_hit_rate": m.expert_hit_rate,
+            "ssd_mb_per_token": m.ssd_mb_per_token,
+            "ssd_gb_read": m.ssd_gb_read,
+            "expert_cache_gb": st["cache_capacity_gb"] if st else None,
+            "cached_experts": st["cached_experts"] if st else None,
+            "active_experts": self.options.active_experts,
+            "packed_experts": st["packed"] if st else None,
             "device": "metal" if mx.metal.is_available() else "cpu",
             "chip": self.hw.chip,
             "mlx_version": mx.__version__,
@@ -533,15 +716,20 @@ class Engine:
             "id": opts.model,
             "path": str(self.model_path),
             "type": self.config.get("model_type"),
-            "moe": bool(self.streaming) or bool(find_expert_modules(self.model)),
+            "moe": bool(self.streaming) or bool(self.dsv41) or bool(find_expert_modules(self.model)),
+            "backend": "omlx" if self.dsv41 is not None else "mlx-lm",
             "resident_gb": round(self.resident_bytes / GB, 2),
             "load_seconds": round(self.load_seconds, 1),
             "draft_model": opts.draft_model,
             "quantization": self.config.get("quantization"),
+            "active_experts": opts.active_experts,
+            "default_active_experts": self.default_active_experts,
         }
         d["options"] = asdict(opts)
         d["context"] = {**self.plan.to_dict(), "current_yarn_factor": self._yarn_now}
         d["expert_streaming"] = self.streaming.to_dict() if self.streaming else None
+        if self.dsv41 is not None:
+            d["expert_streaming"] = {**self.dsv41.plan.to_dict(), **(dsv41.expert_stats(self.model) or {})}
         d["prefix_cache"] = {
             "entries": len(self.prefix),
             "gb": round(self.prefix.nbytes / GB, 2),

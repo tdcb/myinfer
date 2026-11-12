@@ -223,6 +223,35 @@ def hub_info(repo_id: str, budget_bytes: int, kv_bits: int = 8) -> dict:
     return out
 
 
+def _expert_layout(tc: dict, bits: Optional[int]) -> Optional[dict]:
+    """Routed-expert sizes from a MoE config: bytes per expert, per layer and per token."""
+    n_exp = tc.get("n_routed_experts") or tc.get("num_experts") or tc.get("num_local_experts")
+    if not n_exp:
+        return None
+    layers = int(tc.get("num_hidden_layers") or 0)
+    dense_first = int(tc.get("first_k_dense_replace") or 0)
+    sparse = set(range(dense_first, layers))
+    step = int(tc.get("decoder_sparse_step") or 0)  # Qwen MoE: every step-th layer is sparse
+    if step > 1:
+        sparse = {i for i in sparse if (i + 1) % step == 0}
+    freq = int(tc.get("moe_layer_freq") or 0)  # DeepSeek-V2 style
+    if freq > 1:
+        sparse = {i for i in sparse if i % freq == 0}
+    sparse -= {int(i) for i in (tc.get("mlp_only_layers") or [])}
+    moe_layers = len(sparse)
+    if moe_layers <= 0:
+        return None
+    inter = int(tc.get("moe_intermediate_size") or tc.get("intermediate_size") or 0)
+    hidden = int(tc.get("hidden_size") or 0)
+    k = int(tc.get("num_experts_per_tok") or tc.get("n_activated_experts") or 0)
+    # MLX quantization keeps a 16-bit scale and bias per 64-weight group: +0.5 bit/weight.
+    bytes_per_weight = ((bits or 16) + (0.5 if bits else 0)) / 8
+    expert_bytes = int(3 * hidden * inter * bytes_per_weight)
+    return {"experts": int(n_exp), "moe_layers": moe_layers, "active": k, "expert_bytes": expert_bytes,
+            "total_bytes": expert_bytes * int(n_exp) * moe_layers,
+            "per_token_bytes": expert_bytes * k * moe_layers}
+
+
 def estimate_fit(cfg: dict, weight_bytes: int, budget_bytes: int, kv_bits: int = 8) -> dict:
     """Rough pre-download estimate; the real plan is computed after loading."""
     tc = cfg.get("text_config", cfg)
@@ -232,21 +261,39 @@ def estimate_fit(cfg: dict, weight_bytes: int, budget_bytes: int, kv_bits: int =
     hidden = int(tc.get("hidden_size") or 4096)
     reserve = reserve_bytes(budget_bytes, hidden, 2048)
     free = budget_bytes - weight_bytes - reserve
+    per_tok = kv_estimate_per_token(cfg, kv_bits)
+    model_limit = int(native * MAX_YARN_FACTOR) if yarn_capable(cfg) else plain
+
+    def ctx(kv_bytes: int) -> int:
+        mem = int(kv_bytes // per_tok) // 256 * 256 if per_tok else plain
+        return max(0, min(mem, model_limit))
+
+    out = {"moe": moe, "bits": q.get("bits"), "model_type": cfg.get("model_type"),
+           "size_gb": round(weight_bytes / GB, 2), "native_context": native}
     if free > 0:
-        fit = "fits in memory"
-    elif moe:
-        fit = "streams experts from SSD"
-    else:
-        fit = "too large"
-    est = None
-    if free > 0:
-        per_tok = kv_estimate_per_token(cfg, kv_bits)
-        mem = int(free // per_tok) // 256 * 256 if per_tok else plain
-        model_limit = int(native * MAX_YARN_FACTOR) if yarn_capable(cfg) else plain
-        est = max(0, min(mem, model_limit))
-    return {"moe": moe, "bits": q.get("bits"), "model_type": cfg.get("model_type"),
-            "size_gb": round(weight_bytes / GB, 2), "native_context": native,
-            "fit": fit, "est_max_context": est}
+        return {**out, "fit": "fits in memory", "est_max_context": ctx(free)}
+    layout = _expert_layout(tc, q.get("bits")) if moe else None
+    if layout is None:
+        return {**out, "fit": "too large", "est_max_context": None}
+    # Streamed: non-expert weights stay resident; what is left splits between the expert cache and KV.
+    expert_total = min(layout["total_bytes"], weight_bytes)
+    resident = weight_bytes - expert_total
+    left = budget_bytes - resident - reserve
+    if left <= 0:
+        return {**out, "fit": "too large", "est_max_context": None,
+                "est_resident_gb": round(resident / GB, 1), "est_expert_gb": round(expert_total / GB, 1),
+                "note": "Even without its experts the model does not fit in the memory budget."}
+    cache = left // 2
+    return {
+        **out, "fit": "streams experts from SSD", "est_max_context": ctx(left - cache),
+        "est_resident_gb": round(resident / GB, 1), "est_expert_gb": round(expert_total / GB, 1),
+        "est_expert_cache_gb": round(cache / GB, 1),
+        "est_experts_in_memory_pct": round(100 * min(1.0, cache / max(expert_total, 1)), 1),
+        "expert_mb": round(layout["expert_bytes"] / 1024**2, 1),
+        "active_experts": layout["active"],
+        # Every token's experts read from the SSD (a cold cache); the hit rate lowers it.
+        "est_ssd_mb_per_token_cold": round(layout["per_token_bytes"] / 1024**2),
+    }
 
 
 def check_update(entry: dict) -> dict:
@@ -396,7 +443,7 @@ def _remove_stale(local: Path, remote_files: set) -> None:
     """After an upgrade, drop files the new revision no longer has (e.g. re-sharded weights)."""
     for f in local.rglob("*"):
         rel = f.relative_to(local).as_posix()
-        if f.is_file() and not rel.startswith(".cache/") and rel != META_FILE and _wanted(rel) \
+        if f.is_file() and not rel.startswith((".cache/", ".m5engine/")) and rel != META_FILE and _wanted(rel) \
                 and rel not in remote_files:
             f.unlink()
 
