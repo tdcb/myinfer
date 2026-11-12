@@ -361,8 +361,9 @@ class Engine:
         if opts.draft_model:
             raise EngineError("DeepSeek V4.1 does not take a separate draft model.")
         budget = self.budget_bytes(opts)
-        native, plain_limit = native_context(config)
-        hidden = int(config.get("text_config", config).get("hidden_size") or 5120)
+        text_cfg = {**config, **config.get("text_config", {})}  # position/rope settings live in text_config
+        native, plain_limit = native_context(text_cfg)
+        hidden = int(text_cfg.get("hidden_size") or 5120)
         reserve = reserve_bytes(budget, hidden, opts.prefill_step)
         # DeepSeek's compressed KV is small (~1 KB/token); hold back the KV for the
         # first 32K tokens before fitting experts, and plan the rest after measuring.
@@ -383,7 +384,7 @@ class Engine:
         per_tok, fixed = dsv41.measure_cache_bytes(model)
         fp = KVFootprint(per_tok, fixed, 0)
         plan = plan_context(
-            config=config, footprint=fp, budget_bytes=budget, resident_weight_bytes=resident_bytes,
+            config=text_cfg, footprint=fp, budget_bytes=budget, resident_weight_bytes=resident_bytes,
             expert_cache_bytes=0, prefill_step=opts.prefill_step, rope_scaling="off",
             requested_context=opts.max_context,
         )
