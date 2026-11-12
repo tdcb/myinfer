@@ -68,6 +68,11 @@ def test_estimate_fit():
     assert moe_big["est_ssd_mb_per_token_cold"] == round(3 * 2048 * 768 * 4.5 / 8 * 8 * 48 / 1024**2)
     assert 0 < moe_big["est_experts_in_memory_pct"] < 100 and moe_big["est_max_context"] > 0
     assert moe_big["est_resident_gb"] + moe_big["est_expert_gb"] == pytest.approx(60, abs=0.2)
+    # Interleaved dense layers (Qwen decoder_sparse_step, mlp_only_layers) are not expert layers.
+    half = M.estimate_fit({**moe_cfg, "decoder_sparse_step": 2}, 60 * GB, 48 * GB)
+    assert half["est_ssd_mb_per_token_cold"] == round(moe_big["est_ssd_mb_per_token_cold"] / 2)
+    fewer = M.estimate_fit({**moe_cfg, "mlp_only_layers": [0, 1]}, 60 * GB, 48 * GB)
+    assert fewer["est_expert_gb"] < moe_big["est_expert_gb"]
     # DeepSeek-V4.1-Flash-like: dense first layers, 384 experts, 6 active; too big even without experts at 2-bit.
     ds_cfg = {"model_type": "deepseek_v41", "text_config": {
         "n_routed_experts": 384, "num_experts_per_tok": 6, "moe_intermediate_size": 2304, "hidden_size": 5120,

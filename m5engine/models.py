@@ -229,7 +229,16 @@ def _expert_layout(tc: dict, bits: Optional[int]) -> Optional[dict]:
     if not n_exp:
         return None
     layers = int(tc.get("num_hidden_layers") or 0)
-    moe_layers = layers - int(tc.get("first_k_dense_replace") or 0)
+    dense_first = int(tc.get("first_k_dense_replace") or 0)
+    moe_layers = layers - dense_first
+    step = int(tc.get("decoder_sparse_step") or 0)  # Qwen MoE: every step-th layer is sparse
+    if step > 1:
+        moe_layers = sum(1 for i in range(dense_first, layers) if (i + 1) % step == 0)
+    freq = int(tc.get("moe_layer_freq") or 0)  # DeepSeek-V2 style
+    if freq > 1:
+        moe_layers = sum(1 for i in range(dense_first, layers) if i % freq == 0)
+    only = tc.get("mlp_only_layers") or []
+    moe_layers -= sum(1 for i in only if dense_first <= int(i) < layers)
     if moe_layers <= 0:
         return None
     inter = int(tc.get("moe_intermediate_size") or tc.get("intermediate_size") or 0)
