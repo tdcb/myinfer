@@ -16,10 +16,15 @@ architectures, tokenizers and chat templates. On top of that, M5Engine adds:
   quality.
 - **SSD expert streaming for MoE models larger than memory.** Attention,
   embeddings, routers and shared experts stay resident. Routed experts are
-  read on demand from the safetensors files into a byte-bounded LRU cache,
-  with parallel `pread`s, `F_NOCACHE` on macOS, and the next layer's experts
-  prefetched during decode. This is turned on automatically when a MoE model
-  doesn't fit.
+  read on demand into a byte-bounded expert cache, with parallel `pread`s,
+  `F_NOCACHE` on macOS, and the next layer's experts prefetched during
+  decode. This is turned on automatically when a MoE model doesn't fit.
+- **Strata-style expert tiering on unified memory.** A saved hot-expert
+  profile drives eviction and a background warm fill at load, the expert
+  cache borrows KV budget that the current request doesn't need, an optional
+  contiguous experts sidecar makes an expert one SSD read, and
+  `active_experts` trades a little quality for fewer bytes per token. Every
+  request reports SSD MB/token and the expert hit rate.
 - **Prefix KV cache.** Multi-turn chats reuse the KV cache of the longest
   matching prefix. It is moved, not copied, so it costs no extra memory, and
   its size counts against the KV budget.
@@ -73,8 +78,12 @@ by the model's position limit, or by your `--max-context`.
 | Qwen3-235B-A22B 3/4-bit (MoE, 22B active) | 103 / 132 GB | expert streaming |
 
 Decode speed is bounded by memory bandwidth for in-memory models. For streamed
-models it is bounded by SSD reads of cache-missing experts, so a bigger
-`--expert-cache-gb` trades context for speed.
+models it is bounded by SSD reads of cache-missing experts
+(`ssd_mb_per_token` in every request's metrics): a bigger `--expert-cache-gb`,
+a lower-bit checkpoint or `--active-experts` all cut it. DeepSeek-V4.1-Flash
+(552B, 384 experts/layer, 6 active; 222-292 GiB as MLX 2-bit) is the target
+for the streamed path and needs ~300 GB of SSD; it is not yet loadable because
+mlx-lm lacks its Engram layers (see Status).
 
 ## Layout
 
@@ -83,7 +92,7 @@ m5engine/
   engine.py         model lifecycle, generation, context enforcement
   context.py        KV footprint measurement, context planner, YaRN
   attention.py      memory-bounded attention over quantized KV
-  expert_stream.py  SSD expert streaming + LRU expert cache + prefetch
+  expert_stream.py  SSD expert streaming, hot-expert profile, elastic cache, experts sidecar
   prefix_cache.py   longest-prefix KV reuse
   hardware.py       RAM / GPU working set / thermal state
   server.py         OpenAI-compatible HTTP server and control API
@@ -110,3 +119,9 @@ python tools/test_openai_api.py --port 8080   # against a running server with a 
   yet.
 - Custom Metal kernels (`native/`) are planned only where profiling on the
   M5 shows MLX is the bottleneck.
+- The expert tiering (profile, warm fill, elastic cache, sidecar, active
+  experts) is verified on Linux/CPU with OLMoE; its effect on speed needs a
+  Mac and an SSD-streamed model (`python -m m5engine bench --preset strata`).
+- DeepSeek-V4.1-Flash: mlx-lm 0.32's `deepseek_v41` refuses the checkpoint
+  because its Engram (n-gram memory) layers are not implemented there; the
+  model needs a dedicated implementation before it can be benchmarked.

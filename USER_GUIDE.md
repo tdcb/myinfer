@@ -63,15 +63,59 @@ With `stream_experts=auto`, a MoE model that doesn't fit is loaded with only
 its non-expert weights resident. For each MoE layer the engine:
 
 1. evaluates the router and reads back the chosen experts,
-2. loads missing experts from the safetensors files (contiguous per-expert
-   slices, parallel reads, `F_NOCACHE`) into an LRU cache,
+2. loads missing experts from disk (parallel reads, `F_NOCACHE`) into a
+   byte-bounded expert cache,
 3. runs the normal quantized expert matmul on just those experts.
 
 During decode it also predicts the next layer's experts from the current
-hidden state and starts reading them early. The UI shows the cache hit rate,
-prefetch use and read throughput. Speed depends on the hit rate and SSD
-bandwidth. A bigger `expert_cache_gb` raises the hit rate but leaves less
-memory for context; lower-bit checkpoints (e.g. 3-bit) fit more experts.
+hidden state and starts reading them early.
+
+The placement follows Strata's design (a GPU/RAM/SSD tiering engine for
+NVIDIA cards), adapted to unified memory where the GPU, the CPU and the
+expert cache all share one pool:
+
+- **Hot-expert profile.** The engine keeps a decayed count of how often each
+  expert is routed to, saved next to the model in `.m5engine/expert-profile.npz`
+  (every 5 requests and on unload). Eviction drops the *coldest* expert, not
+  the least recent, and the next load pre-reads the hottest experts in the
+  background so the first answer starts from a warm cache. A profile learned
+  from one kind of work (code, chat) speeds that kind up most.
+- **Elastic expert cache.** The context plan reserves the KV budget for the
+  full context, but a request that needs less lends the rest to the expert
+  cache; a longer request shrinks it back, evicting the coldest experts. The
+  UI shows `cache x / y (base z)` while the cache is borrowing.
+- **Contiguous experts sidecar.** `python -m m5engine repack --model DIR`
+  writes `.m5engine/experts.pack`, where each expert's tensors (9 for a
+  quantized expert) sit together, so an expert is one SSD read instead of nine.
+  It is a second copy of the experts (same size as the expert weights), used
+  automatically when present and ignored when the checkpoint changes.
+- **Active experts ("Speed").** `active_experts=5` on a 6-expert model reads
+  5/6 of the expert bytes per token at a small quality cost. Fewer than the
+  model's default only; the UI lists the default beside it.
+- **Per-request SSD metrics.** `ssd_mb_per_token` (expert bytes read from
+  disk per generated token) and `expert_hit_rate` are reported for every
+  request and benchmark. Decode speed on a streamed model is roughly
+  `SSD bandwidth / ssd_mb_per_token`, so these two numbers tell you whether a
+  bigger cache, a lower-bit checkpoint or fewer active experts would help.
+
+What is *not* carried over from Strata: computing missed experts on the CPU.
+On NVIDIA that hides PCIe copies behind GPU work; on Apple Silicon the CPU
+and GPU read the same memory and the same SSD, so the SSD read is the whole
+cost either way.
+
+### Benchmarking a streamed model
+
+```sh
+python -m m5engine bench --model DIR --preset strata     # 64-, 3,000- and 14,000-token prompts
+python -m m5engine bench --model DIR --preset quick --active-experts 5
+```
+
+Results (decode and prefill tok/s, TTFT, peak memory, cache size, hit rate,
+SSD MB/token) go into `models/benchmarks.json` and show in the Models tab.
+Run the same preset twice: the second run starts from the saved profile and
+shows what the warm cache is worth. `python -m m5engine plan --estimate
+--model REPO` prints the disk, memory and context estimate for a Hub repo
+without downloading it.
 
 ## 5. Managing models (Models tab)
 

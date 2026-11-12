@@ -34,6 +34,8 @@ from .context import (
     yarn_factor_for,
 )
 from .expert_stream import (
+    repack_experts,
+    set_active_experts,
     StreamingInfo,
     enable_expert_streaming,
     estimate_expert_bytes,
@@ -68,6 +70,11 @@ class LoadOptions:
     expert_cache_gb: Optional[float] = None
     io_threads: int = 8
     prefetch_experts: bool = True
+    expert_profile: bool = True  # learn which experts are hot; saved next to the model
+    expert_pack: bool = True  # use the contiguous experts sidecar when one exists
+    warm_experts: bool = True  # pre-read the profile's hottest experts at load
+    elastic_expert_cache: bool = True  # lend unused KV budget to the expert cache
+    active_experts: Optional[int] = None  # route to fewer experts than the model's default
     draft_model: Optional[str] = None
     num_draft_tokens: int = 3
     prefill_step: int = 2048
@@ -119,6 +126,9 @@ class RequestMetrics:
     yarn_factor: float = 1.0
     peak_memory_gb: float = 0.0
     finish_reason: str = ""
+    expert_hit_rate: Optional[float] = None
+    ssd_mb_per_token: Optional[float] = None  # expert bytes read from disk per generated token
+    ssd_gb_read: float = 0.0
 
 
 def _param_bytes(model) -> int:
@@ -148,6 +158,8 @@ class Engine:
         self.plan: Optional[ContextPlan] = None
         self.footprint: Optional[KVFootprint] = None
         self.streaming: Optional[StreamingInfo] = None
+        self.default_active_experts: Optional[int] = None
+        self._requests_since_save = 0
         self.prefix = PrefixCache()
         self.resident_bytes = 0
         self.load_seconds = 0.0
@@ -177,6 +189,7 @@ class Engine:
 
     def _unload(self) -> None:
         if self.streaming:
+            self.save_profile()
             self.streaming.cache.close()
         self.model = self.draft_model = self.tokenizer = None
         self.streaming = None
@@ -240,6 +253,16 @@ class Engine:
                 "Use a smaller quantization, or a MoE model with expert streaming."
             )
 
+        if opts.active_experts is not None:
+            if not has_experts:
+                raise EngineError("active_experts only applies to Mixture-of-Experts models.")
+            try:
+                self.default_active_experts, _ = set_active_experts(model, opts.active_experts)
+            except ValueError as e:
+                raise EngineError(str(e)) from None
+        else:
+            self.default_active_experts = None
+
         streaming = None
         if stream:
             expert_total = estimate_expert_bytes(path, model)
@@ -257,7 +280,8 @@ class Engine:
                 cache_bytes = int(free * 0.5)
             cache_bytes = max(0, min(cache_bytes, expert_total, free - int(min_kv / 4)))
             streaming = enable_expert_streaming(
-                model, path, cache_bytes, io_threads=opts.io_threads, prefetch=opts.prefetch_experts
+                model, path, cache_bytes, io_threads=opts.io_threads, prefetch=opts.prefetch_experts,
+                profile=opts.expert_profile, use_pack=opts.expert_pack, warm=opts.warm_experts,
             )
 
         mx.eval(model.parameters())
@@ -303,6 +327,7 @@ class Engine:
             self._set_yarn(plan.yarn_factor)
         self.load_seconds = time.perf_counter() - t0
         self.last = RequestMetrics()
+        self._requests_since_save = 0
         log.info(
             "Loaded %s in %.1fs: resident %.1f GB, max context %d (%s)",
             opts.model, self.load_seconds, resident_bytes / GB, plan.max_context, plan.limited_by,
@@ -378,6 +403,9 @@ class Engine:
                 hit = 0
             need = self.footprint.bytes_for(len(tokens) + max_tokens)
             self.prefix.evict_to(self.plan.kv_budget_bytes - need)
+            self._resize_expert_cache(need)
+            st = self.streaming.cache.stats if self.streaming else None
+            io0 = (st.hits, st.misses, st.bytes_read) if st else None
 
             if params.seed is not None:
                 mx.random.seed(params.seed)
@@ -425,6 +453,7 @@ class Engine:
                         t_first = time.perf_counter()
                         m.ttft_ms = (t_first - t0) * 1000
                         m.prompt_tps = resp.prompt_tps
+                        decode_bytes0 = st.bytes_read if st else 0
                     if not (resp.finish_reason == "stop" and resp.token in self.tokenizer.eos_token_ids):
                         generated.append(resp.token)
                     m.draft_accepted += int(resp.from_draft)
@@ -451,7 +480,16 @@ class Engine:
                 m.completion_tokens = len(generated)
                 m.finish_reason = finish
                 m.peak_memory_gb = round(mx.get_peak_memory() / GB, 2)
+                if st is not None:
+                    hits, misses = st.hits - io0[0], st.misses - io0[1]
+                    m.expert_hit_rate = round(hits / (hits + misses), 4) if hits + misses else None
+                    m.ssd_gb_read = round((st.bytes_read - io0[2]) / GB, 3)
+                    if t_first is not None and m.completion_tokens:
+                        m.ssd_mb_per_token = round((st.bytes_read - decode_bytes0) / 1024**2 / m.completion_tokens, 1)
                 self.last = m
+                self._requests_since_save += 1
+                if self.streaming and self._requests_since_save >= 5:
+                    self.save_profile()
                 self.totals["requests"] += 1
                 self.totals["prompt_tokens"] += m.prompt_tokens
                 self.totals["completion_tokens"] += m.completion_tokens
@@ -459,6 +497,50 @@ class Engine:
                 if use_prefix and (draft is not None or self.draft_model is None):
                     self.prefix.put(key, tokens + generated, cache)
             yield Chunk("", finish, m)
+
+    # ------------------------------------------------------- expert tiers
+    def _resize_expert_cache(self, kv_need_bytes: int) -> None:
+        """Lend the KV budget this request does not need to the expert cache (Strata's kv-grow).
+
+        The plan still guarantees the full context: the cache shrinks back to
+        its base size, evicting the coldest experts, when a longer request comes.
+        """
+        if not self.streaming:
+            return
+        cache = self.streaming.cache
+        base = self.streaming.base_capacity_bytes
+        if not self.options.elastic_expert_cache:
+            cache.set_capacity(base)
+            return
+        spare = self.plan.kv_budget_bytes - kv_need_bytes - self.prefix.nbytes
+        target = base + max(0, spare)
+        target = min(target, base + self.streaming.total_expert_bytes)
+        if target < cache.capacity_bytes:
+            cache.set_capacity(target)
+            mx.clear_cache()
+        else:
+            cache.set_capacity(target)
+
+    def save_profile(self) -> None:
+        if self.streaming and self.streaming.cache.profile is not None and self.model_path is not None:
+            self.streaming.cache.profile.save(self.model_path)
+            self._requests_since_save = 0
+
+    def repack(self, progress=None) -> Path:
+        """Write the contiguous expert sidecar for the loaded (or streaming) MoE model."""
+        if not self.loaded:
+            raise NotLoaded("No model loaded")
+        if not find_expert_modules(self.model) and not self.streaming:
+            raise EngineError("Repacking only applies to Mixture-of-Experts models.")
+        with self._gen_lock:
+            model = self.model
+            if self.streaming:
+                # The wrappers hide the SwitchGLU modules; locate via the recorded layouts.
+                from .expert_stream import write_expert_pack
+                counts = [max(t.stacked.shape[0] if t.stacked else len(t.per_expert) for t in locs.values())
+                          for locs in self.streaming.layer_locs]
+                return write_expert_pack(self.model_path, self.streaming.layer_locs, counts, progress)
+            return repack_experts(model, self.model_path, progress)
 
     # ------------------------------------------------------------ benchmark
     def benchmark(self, prompt_tokens: int = 1024, gen_tokens: int = 128, use_draft: bool = True) -> dict:
@@ -483,15 +565,10 @@ class Engine:
             n = max(1, n + prompt_tokens - len(tokens))
         params = GenerationParams(max_tokens=gen_tokens, temperature=0.0, use_prefix_cache=False,
                                   use_draft=use_draft)
-        st = self.streaming.cache.stats if self.streaming else None
-        before = (st.hits, st.misses) if st else (0, 0)
         m = None
         for chunk in self.generate(tokens, params):
             m = chunk.metrics or m
-        hit_rate = None
-        if st:
-            hits, misses = st.hits - before[0], st.misses - before[1]
-            hit_rate = round(hits / (hits + misses), 4) if hits + misses else 0.0
+        st = self.streaming.to_dict() if self.streaming else None
         return {
             "time": time.time(),
             "model": self.options.model,
@@ -506,7 +583,13 @@ class Engine:
             "kv_bits": self.options.kv_bits,
             "max_context": self.plan.max_context,
             "expert_streaming": st is not None,
-            "expert_hit_rate": hit_rate,
+            "expert_hit_rate": m.expert_hit_rate,
+            "ssd_mb_per_token": m.ssd_mb_per_token,
+            "ssd_gb_read": m.ssd_gb_read,
+            "expert_cache_gb": st["cache_capacity_gb"] if st else None,
+            "cached_experts": st["cached_experts"] if st else None,
+            "active_experts": self.options.active_experts,
+            "packed_experts": st["packed"] if st else None,
             "device": "metal" if mx.metal.is_available() else "cpu",
             "chip": self.hw.chip,
             "mlx_version": mx.__version__,
@@ -538,6 +621,8 @@ class Engine:
             "load_seconds": round(self.load_seconds, 1),
             "draft_model": opts.draft_model,
             "quantization": self.config.get("quantization"),
+            "active_experts": opts.active_experts,
+            "default_active_experts": self.default_active_experts,
         }
         d["options"] = asdict(opts)
         d["context"] = {**self.plan.to_dict(), "current_yarn_factor": self._yarn_now}

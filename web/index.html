@@ -125,6 +125,7 @@
         <select id="stream_experts"><option value="auto" selected>auto</option><option value="on">on</option><option value="off">off</option></select>
       </label>
       <label>Expert cache GB (blank = auto)<input id="expert_cache_gb" type="number" step="1" /></label>
+      <label title="Route each token to fewer experts than the model's default: less read from the SSD per token, slightly lower quality">Active experts (blank = model default)<input id="active_experts" type="number" min="1" step="1" /></label>
     </div>
     <label>Draft model for speculative decoding (optional)<input id="draft_model" list="local-models" placeholder="mlx-community/Qwen3-0.6B-4bit" /></label>
     </div></details>
@@ -279,10 +280,14 @@ async function refresh() {
     ['weights resident', gb(c.resident_weight_gb)], ['prefix cache', `${s.prefix_cache.entries} conv · ${gb(s.prefix_cache.gb)}`]]);
   const es = s.expert_streaming;
   $('stream-card').style.display = es ? '' : 'none';
-  if (es) kv($('stream'), [['experts on disk', gb(es.total_expert_gb)], ['cache', `${gb(es.cache_used_gb)} / ${gb(es.cache_capacity_gb)}`],
-    ['cache slots', `${fmt(es.cache_slots)} × ${es.expert_mb} MB`], ['hit rate', `${(es.hit_rate * 100).toFixed(1)}%`],
-    ['prefetch used / issued', `${fmt(es.prefetch_used)} / ${fmt(es.prefetch_issued)}`], ['read', `${es.gb_read} GB @ ${es.read_gb_per_s} GB/s`]]);
   const m = s.last_request;
+  if (es) kv($('stream'), [['experts on disk', `${gb(es.total_expert_gb)}${es.packed ? ' (packed)' : ''}`],
+    ['cache', `${gb(es.cache_used_gb)} / ${gb(es.cache_capacity_gb)}${es.cache_capacity_gb > es.cache_base_gb ? ` (base ${gb(es.cache_base_gb)})` : ''}`],
+    ['experts in memory', `${fmt(es.cached_experts)} of ${fmt(es.moe_layers * es.num_experts)} (${(es.resident_fraction * 100).toFixed(0)}%) × ${es.expert_mb} MB`],
+    ['hit rate', `${(es.hit_rate * 100).toFixed(1)}%${m && m.ssd_mb_per_token != null ? ` · last request ${m.ssd_mb_per_token} MB/token from SSD` : ''}`],
+    ['prefetch used / issued', `${fmt(es.prefetch_used)} / ${fmt(es.prefetch_issued)}`], ['read', `${es.gb_read} GB @ ${es.read_gb_per_s} GB/s`],
+    ['hot-expert profile', es.profile ? `${fmt(es.profile.steps)} steps · ${fmt(es.profile.observed_experts)} experts seen · ${fmt(es.warmed)} pre-read` : 'off'],
+    ['active experts', s.model.active_experts ? `${s.model.active_experts} of ${s.model.default_active_experts}` : 'model default']]);
   if (m && m.prompt_tokens) {
     $('m-ttft').textContent = `${Math.round(m.ttft_ms)} ms`; $('m-ptps').textContent = m.prompt_tps.toFixed(1);
     $('m-dtps').textContent = m.decode_tps.toFixed(1); $('m-cached').textContent = `${fmt(m.cached_tokens)}/${fmt(m.prompt_tokens)}`;
@@ -361,7 +366,7 @@ async function loadHistory(m, i) {
     d.data.slice().reverse().map(r => `<tr><td>${ago(r.time)}</td><td class="num">${fmt(r.prompt_tokens)} / ${fmt(r.completion_tokens)}</td>
       <td class="num">${r.decode_tps.toFixed(1)}</td><td class="num">${tps(r.prompt_tps)}</td><td class="num">${fmt(Math.round(r.ttft_ms))} ms</td>
       <td class="num">${r.peak_memory_gb}</td>
-      <td>${r.kv_bits ? r.kv_bits + '-bit KV' : 'fp16 KV'}${r.draft_model ? ` · draft ${esc(r.draft_model.split('/').pop())} (${fmt(r.draft_accepted)} accepted)` : ''}${r.expert_streaming ? ` · SSD experts, ${(r.expert_hit_rate * 100).toFixed(0)}% hit` : ''}</td>
+      <td>${r.kv_bits ? r.kv_bits + '-bit KV' : 'fp16 KV'}${r.draft_model ? ` · draft ${esc(r.draft_model.split('/').pop())} (${fmt(r.draft_accepted)} accepted)` : ''}${r.expert_streaming ? ` · SSD experts${r.expert_cache_gb ? ` (${gb(r.expert_cache_gb)} cache)` : ''}, ${r.expert_hit_rate != null ? (r.expert_hit_rate * 100).toFixed(0) : 0}% hit${r.ssd_mb_per_token != null ? `, ${r.ssd_mb_per_token} MB/token` : ''}${r.active_experts ? `, ${r.active_experts} active` : ''}` : ''}</td>
       <td>${esc(r.chip)} · ${r.device}</td></tr>`).join('') + '</tbody></table>';
 }
 
@@ -534,7 +539,7 @@ $('btn-load').onclick = async () => {
   body.kv_bits = Number($('kv_bits').value);
   body.rope_scaling = $('rope_scaling').value;
   body.stream_experts = $('stream_experts').value;
-  for (const k of ['max_context', 'memory_budget_gb', 'expert_cache_gb']) if ($(k).value) body[k] = Number($(k).value);
+  for (const k of ['max_context', 'memory_budget_gb', 'expert_cache_gb', 'active_experts']) if ($(k).value) body[k] = Number($(k).value);
   if ($('draft_model').value.trim()) body.draft_model = $('draft_model').value.trim();
   const r = await fetch('/v1/models/load', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!r.ok) localError = (await r.json()).error.message;
