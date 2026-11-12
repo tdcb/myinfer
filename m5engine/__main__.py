@@ -121,7 +121,7 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    from .engine import Engine, GenerationParams, LoadOptions
+    from .engine import Engine, LoadOptions
 
     engine = Engine()
     if a.cmd == "plan" and a.estimate:
@@ -162,18 +162,31 @@ def main(argv=None) -> int:
         return 0
 
     info = engine.load(LoadOptions.from_dict(_options(a)))
+    try:
+        return _run_loaded(a, engine, info)
+    finally:
+        engine.unload()  # saves the learned expert profile
+
+
+def _run_loaded(a, engine, info: dict) -> int:
+    from .engine import GenerationParams
+
     if a.cmd == "plan":
         print(json.dumps({k: info.get(k) for k in ("model", "context", "expert_streaming", "hardware")}, indent=2))
         return 0
 
     if a.cmd == "bench":
-        from .models import BenchmarkStore
+        from .models import BenchmarkStore, find_local
 
         store = BenchmarkStore(Path(a.models_dir))
+        try:  # record under the id the Models tab uses for this model
+            key = find_local(Path(a.models_dir), str(engine.model_path))["id"]
+        except KeyError:
+            key = a.model
         results = []
         for prompt_tokens, gen_tokens in BENCH_PRESETS[a.preset]:
             r = engine.benchmark(prompt_tokens, gen_tokens)
-            store.add(a.model, r)
+            store.add(key, r)
             results.append(r)
             if not a.json:
                 print(_bench_row(r), file=sys.stderr)
