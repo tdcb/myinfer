@@ -245,9 +245,16 @@ def measure_cache_bytes(model, tokens: int = 8) -> Tuple[float, int]:
         cache = model.make_cache()
         model(mx.zeros((1, n), dtype=mx.int32), cache=cache)
         arrays = []
+
+        def collect(obj):
+            if isinstance(obj, mx.array):
+                arrays.append(obj)
+            elif isinstance(obj, (list, tuple)):
+                for o in obj:
+                    collect(o)
+
         for c in cache:
-            st = c.state
-            arrays.extend(a for a in (st if isinstance(st, (list, tuple)) else [st]) if isinstance(a, mx.array))
+            collect(c.state)  # DeepseekV41Cache.state nests its arrays: (cache_list, left_padding, lengths)
         mx.eval(arrays)
         return sum(a.nbytes for a in arrays)
 

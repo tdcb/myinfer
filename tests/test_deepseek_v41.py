@@ -59,7 +59,7 @@ class _Model:
         n = ids.shape[1]
         self.calls.append((n, self._scope.active))
         for c in cache:
-            c.state = [mx.zeros((1, 100 + 10 * n)), mx.zeros((1, 4))]  # 10 "bytes"/token/layer + fixed
+            c.state = ([mx.zeros((1, 100 + 10 * n)), (mx.zeros((1, 4)),)], None, None)  # nested like oMLX's
         return mx.zeros((1, n, 4))
 
 
