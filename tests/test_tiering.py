@@ -164,6 +164,11 @@ def test_repacked_experts_match_safetensors(moe, tmp_path):
     (other_dir / pack_path.parent.name).mkdir()
     (other_dir / pack_path.parent.name / pack_path.name).write_bytes(pack_path.read_bytes())
     assert ExpertPack.open(other_dir, locs4) is None
+    # Same layout but re-downloaded weights (new mtime) also invalidate the pack.
+    import os
+    st = (tmp_path / "model.safetensors").stat()
+    os.utime(tmp_path / "model.safetensors", ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    assert ExpertPack.open(tmp_path, locs) is None
 
 
 def test_set_active_experts_changes_routing(moe):

@@ -222,6 +222,8 @@ def to_mx(arr: np.ndarray, st_dtype: str) -> mx.array:
 
 
 def _locs_fingerprint(layer_locs: Sequence[LayerLocs]) -> str:
+    """Identifies the source tensors: their layout plus each source file's size and mtime,
+    so a re-downloaded or re-quantized checkpoint with the same shapes still invalidates the pack."""
     desc = [
         [
             (rel, Path(t.byte_range(0)[0]).name, t.dtype, list(t.shape), t.byte_range(0)[1], t.total_bytes)
@@ -229,7 +231,12 @@ def _locs_fingerprint(layer_locs: Sequence[LayerLocs]) -> str:
         ]
         for locs in layer_locs
     ]
-    return hashlib.sha1(json.dumps(desc).encode()).hexdigest()
+    files = sorted({t.byte_range(0)[0] for locs in layer_locs for t in locs.values()})
+    stats = []
+    for f in files:
+        st = os.stat(f)
+        stats.append((Path(f).name, st.st_size, st.st_mtime_ns))
+    return hashlib.sha1(json.dumps([desc, stats]).encode()).hexdigest()
 
 
 class ExpertPack:
@@ -684,7 +691,7 @@ def _set_attr_path(root: nn.Module, rel: str, value) -> None:
     setattr(obj, leaf, value)
 
 
-_TOP_K_NAMES = ("num_experts_per_tok", "top_k", "n_activated_experts")
+_TOP_K_NAMES = ("num_experts_per_tok", "top_k", "n_activated_experts", "k")  # "k": Ernie
 
 
 def _router_top_k(parent: nn.Module, default: int) -> int:
