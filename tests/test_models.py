@@ -76,6 +76,9 @@ def test_estimate_fit():
     assert half["est_expert_gb"] == pytest.approx(moe_big["est_expert_gb"] / 2, abs=0.1)
     fewer = M.estimate_fit({**moe_cfg, "mlp_only_layers": [0, 1]}, 50 * GB, 48 * GB)
     assert fewer["est_expert_gb"] < moe_big["est_expert_gb"]
+    # A dense-only layer that the sparse step already skips must not be subtracted twice.
+    both = M.estimate_fit({**moe_cfg, "decoder_sparse_step": 2, "mlp_only_layers": [0]}, 50 * GB, 48 * GB)
+    assert both["est_expert_gb"] == half["est_expert_gb"]
     # DeepSeek-V4.1-Flash-like: dense first layers, 384 experts, 6 active; too big even without experts at 2-bit.
     ds_cfg = {"model_type": "deepseek_v41", "text_config": {
         "n_routed_experts": 384, "num_experts_per_tok": 6, "moe_intermediate_size": 2304, "hidden_size": 5120,
