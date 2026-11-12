@@ -200,6 +200,13 @@ class Engine:
             self.streaming.cache.close()
         self.model = self.draft_model = self.tokenizer = None
         self.streaming = None
+        if self.dsv41 is not None:
+            close = getattr(self.model, "close", None)
+            if callable(close):
+                try:
+                    close()  # oMLX's expert store and Engram mappings hold raw descriptors
+                except Exception as e:
+                    log.warning("Closing the DeepSeek model failed: %s", e)
         self.dsv41 = None
         self.plan = None
         self.footprint = None
