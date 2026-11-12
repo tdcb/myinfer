@@ -148,7 +148,8 @@ class Loaded:
     plan: ResidencyPlan
 
 
-def load(path: Path, plan: ResidencyPlan, *, ced_prefill: bool = True, preserve_mtp: bool = False) -> Loaded:
+def load(path: Path, plan: ResidencyPlan, *, ced_prefill: bool = True, preserve_mtp: Optional[bool] = None) -> Loaded:
+    """``preserve_mtp=None`` lets oMLX keep a converted checkpoint's own DSpark layout (``-mtp`` repos)."""
     from mlx_lm.tokenizer_utils import TokenizerWrapper
 
     loading = _mod("deepseek_v41.loading")

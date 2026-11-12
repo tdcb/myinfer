@@ -202,7 +202,7 @@ def test_load_uses_omlx_loader_and_facade(stub_omlx, tmp_path):
     plan = D.ResidencyPlan(0.5, 384, 192, 60, 100, 7, True, 50)
     loaded = D.load(tmp_path, plan, ced_prefill=True)
     assert calls == {"engram_ssd_offload": True, "moe_expert_offload_resident_fraction": 0.5,
-                     "ced_prefill": True, "preserve_mtp": False}
+                     "ced_prefill": True, "preserve_mtp": None}
     assert type(loaded.model) is Facade
     assert loaded.tokenizer.eos_token_ids == {1}
     ids = D.encode_chat(loaded, [{"role": "user", "content": "hi"}], {"reasoning_effort": "low"})
