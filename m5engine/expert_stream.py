@@ -350,6 +350,7 @@ class ExpertProfile:
         self.decay = decay
         self.steps = 0
         self.dirty = False
+        self.paused = False  # e.g. while the engine measures the KV footprint with dummy tokens
         self._lock = threading.Lock()
 
     @staticmethod
@@ -391,6 +392,8 @@ class ExpertProfile:
             return None
 
     def record(self, layer: int, inds: np.ndarray) -> None:
+        if self.paused:
+            return
         counts = np.bincount(inds.ravel().astype(np.int64), minlength=self.scores.shape[1])
         n_tokens = inds.size // max(inds.shape[-1], 1)
         with self._lock:
@@ -643,6 +646,9 @@ class ExpertCache:
         if self._warm_pool is not None:
             self._warm_pool.shutdown(wait=True)
             self._warm_pool = None
+
+    def reset_stats(self) -> None:
+        self.stats = StreamStats()
 
     def clear(self) -> None:
         with self._elock:

@@ -292,11 +292,19 @@ class Engine:
             except Exception as e:  # pragma: no cover - macOS only
                 log.warning("Could not set wired limit: %s", e)
 
+        if streaming and streaming.cache.profile is not None:
+            streaming.cache.profile.paused = True  # the measurement below routes dummy tokens
         fp = measure_kv_footprint(model, opts.kv_bits, opts.kv_group_size)
         if opts.kv_bits and opts.quantized_kv_start:
             dense_fp = measure_kv_footprint(model, 0)
             extra = max(0.0, dense_fp.bytes_per_token - fp.bytes_per_token) * opts.quantized_kv_start
             fp = KVFootprint(fp.bytes_per_token, int(fp.fixed_bytes + extra), fp.kv_bits)
+        if streaming:
+            warmed = streaming.cache.stats.warmed
+            streaming.cache.reset_stats()
+            streaming.cache.stats.warmed = warmed
+            if streaming.cache.profile is not None:
+                streaming.cache.profile.paused = False
         if draft is not None:
             fp = combine(fp, measure_kv_footprint(draft, opts.kv_bits, opts.kv_group_size))
 
