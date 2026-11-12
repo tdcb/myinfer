@@ -474,7 +474,7 @@ class Engine:
             factor = self._yarn_for_request(len(tokens) + max_tokens)
             self._set_yarn(factor)
             key = f"yarn={factor}"
-            use_prefix = opts.prefix_cache and params.use_prefix_cache
+            use_prefix = opts.prefix_cache and params.use_prefix_cache and self.dsv41 is None
             cache, hit = (self.prefix.take(key, tokens) if use_prefix else (None, 0))
             if cache is None:
                 cache = self.model.make_cache() if self.dsv41 is not None else make_prompt_cache(self.model)
